@@ -1,0 +1,16 @@
+[project]
+name = "pi-segment"
+version = "0.1.0"
+description = "Raspberry Pi 5 camera real-time semantic segmentation (MediaPipe DeepLabV3), served as an MJPEG web stream"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # 0.10.18 is the last MediaPipe with a Linux aarch64 (cp312) wheel.
+    "mediapipe==0.10.18",
+    "opencv-python>=4.9",
+    "numpy<2",
+]
+
+[tool.uv]
+# MediaPipe has no cp313 aarch64 wheel; this project runs on the uv-managed 3.12.
+python-preference = "only-managed"
