@@ -29,6 +29,25 @@ come from one of:
 
 **Open item:** confirm whether the monitor has speakers before phase 3.
 
+## Repo conventions
+
+This app lives at `apps/dashboard/`, following the layout established by
+`apps/itunes/`:
+
+- Self-contained directory under `apps/`, with its own `pyproject.toml`,
+  `.python-version`, and `uv.lock`. Managed with `uv`.
+- Entry point at `main.py`; supporting modules under `src/`.
+- README with Prerequisites / Setup / Run / Layout / Troubleshooting sections.
+- Headless — the UI is served over HTTP and opened from any device on the LAN.
+
+**Deviation from `apps/itunes/`:** that app uses the stdlib `http.server` with
+no web framework. This app uses **Flask**. The itunes constraint was a video
+stream with minimal dependencies; this app has form posts, JSON endpoints, and
+two rendered pages, where hand-rolled routing in `BaseHTTPRequestHandler` is
+tedium without benefit. Decision confirmed with the repo owner.
+
+There is no test suite anywhere in the repo yet; this app introduces one.
+
 ## Architecture
 
 A single Python service on the Pi owns storage and serves two pages:
