@@ -15,8 +15,10 @@ if [[ -d "$MODELS/${MODEL}_ncnn_model" ]]; then
 fi
 
 # ultralytics auto-downloads ${MODEL}.pt on first use, then exports to NCNN.
-# Run inside the project's uv venv so ultralytics/torch are available.
+# The NCNN export needs the `pnnx` converter; pull it in ephemerally with
+# --with so it need not be a runtime dependency. Run inside the project's uv
+# venv so ultralytics/torch are available.
 cd "$MODELS"
-uv run --project "$HERE" yolo export "model=${MODEL}.pt" format=ncnn
+uv run --project "$HERE" --with pnnx yolo export "model=${MODEL}.pt" format=ncnn
 
 echo "Done -> $MODELS/${MODEL}_ncnn_model/"
