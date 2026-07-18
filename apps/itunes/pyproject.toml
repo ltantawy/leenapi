@@ -1,16 +1,17 @@
 [project]
 name = "pi-segment"
 version = "0.1.0"
-description = "Raspberry Pi 5 camera real-time semantic segmentation (MediaPipe DeepLabV3), served as an MJPEG web stream"
+description = "Raspberry Pi 5 camera FastSAM segment-everything, served as an MJPEG web stream"
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10"
 dependencies = [
-    # 0.10.18 is the last MediaPipe with a Linux aarch64 (cp312) wheel.
-    "mediapipe==0.10.18",
+    "ultralytics>=8.3",   # provides FastSAM (pulls torch/torchvision CPU wheels)
+    "ncnn>=1.0",          # fast CPU inference backend for the NCNN-exported model
     "opencv-python>=4.9",
-    "numpy<2",
+    "numpy>=1.26",
 ]
 
 [tool.uv]
-# MediaPipe has no cp313 aarch64 wheel; this project runs on the uv-managed 3.12.
+# The uv-managed 3.12 venv is retained; torch/ultralytics also support 3.13 now
+# that MediaPipe's cp312-only constraint is gone.
 python-preference = "only-managed"

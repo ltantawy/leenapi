@@ -1,7 +1,12 @@
-"""Live semantic-segmentation MJPEG server for the Raspberry Pi camera.
+"""Live FastSAM "segment-everything" MJPEG server for the Raspberry Pi camera.
 
-Pipeline: rpicam-vid (MJPEG) -> OpenCV decode -> MediaPipe DeepLabV3 -> colorized
-overlay -> multipart/x-mixed-replace MJPEG stream over HTTP.
+Decoupled pipeline: the camera streams smooth live video while FastSAM runs in a
+background thread (~1-4 FPS on the Pi 5 CPU); the most recent colorized mask
+overlay is blended onto every live frame. Masks therefore lag moving objects —
+an intentional tradeoff to keep the video smooth.
+
+    rpicam-vid (MJPEG) ─► OpenCV decode ─┬─► blend latest overlay ─► MJPEG stream (HTTP)
+                                         └─► FastSAM (bg thread) ─► colorized overlay
 
 Run:   uv run python main.py
 View:  http://<pi-ip>:8000/
@@ -28,68 +33,124 @@ _INDEX_HTML = b"""<!doctype html>
   h1{font-size:1rem;font-weight:600;padding:.6rem;margin:0}
   img{max-width:100%;height:auto}
 </style></head>
-<body><h1>Raspberry Pi 5 &mdash; live DeepLabV3 segmentation</h1>
+<body><h1>Raspberry Pi 5 &mdash; live FastSAM segment-everything</h1>
 <img src="/stream" alt="segmented stream"></body></html>
 """
 
 
-class Broadcaster:
-    """Runs capture+segmentation in one thread; serves the latest JPEG to clients."""
+class Pipeline:
+    """Capture + blend on the fast path; FastSAM segmentation on a slow bg thread.
+
+    Three threads share state: the capture loop publishes each blended frame to
+    HTTP clients and hands the raw frame to the segment worker; the segment
+    worker produces the colorized overlay reused across many frames.
+    """
 
     def __init__(self, camera: RpicamMjpegCamera, segmenter: Segmenter, jpeg_quality: int = 80):
         self._camera = camera
         self._segmenter = segmenter
         self._jpeg_quality = jpeg_quality
-        self._latest: bytes | None = None
-        self._lock = threading.Condition()
         self._running = False
-        self._fps = 0.0
+
+        # Latest raw frame handed from capture -> segment worker.
+        self._raw = None
+        self._raw_id = 0
+        self._raw_cond = threading.Condition()
+
+        # Latest overlay (color_bgr, alpha_map) from the segment worker.
+        self._overlay = None
+        self._overlay_lock = threading.Lock()
+
+        # Latest encoded JPEG served to clients.
+        self._latest: bytes | None = None
+        self._out_cond = threading.Condition()
+
+        self._video_fps = 0.0
+        self._seg_fps = 0.0
 
     def start(self) -> None:
         self._running = True
-        threading.Thread(target=self._loop, name="capture", daemon=True).start()
+        threading.Thread(target=self._capture_loop, name="capture", daemon=True).start()
+        threading.Thread(target=self._segment_loop, name="segment", daemon=True).start()
 
-    def _loop(self) -> None:
+    def _capture_loop(self) -> None:
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality]
         last = time.monotonic()
         for frame in self._camera.frames():
             if not self._running:
                 break
-            overlay = self._segmenter.overlay(frame)
+
+            # Hand the newest raw frame to the segment worker.
+            with self._raw_cond:
+                self._raw = frame
+                self._raw_id += 1
+                self._raw_cond.notify_all()
+
+            # Blend the most recent overlay (if any) onto this live frame.
+            with self._overlay_lock:
+                overlay = self._overlay
+            if overlay is not None:
+                display = self._segmenter.blend(frame, overlay[0], overlay[1])
+            else:
+                display = frame
 
             now = time.monotonic()
             dt = now - last
             last = now
             if dt > 0:
-                self._fps = 0.9 * self._fps + 0.1 * (1.0 / dt)
+                self._video_fps = 0.9 * self._video_fps + 0.1 * (1.0 / dt)
             cv2.putText(
-                overlay, f"{self._fps:4.1f} FPS", (10, 26),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA,
+                display, f"{self._video_fps:4.1f} FPS video  {self._seg_fps:4.1f} FPS seg",
+                (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA,
             )
 
-            ok, jpeg = cv2.imencode(".jpg", overlay, encode_params)
+            ok, jpeg = cv2.imencode(".jpg", display, encode_params)
             if not ok:
                 continue
-            with self._lock:
+            with self._out_cond:
                 self._latest = jpeg.tobytes()
-                self._lock.notify_all()
+                self._out_cond.notify_all()
+
+    def _segment_loop(self) -> None:
+        processed_id = 0
+        last = time.monotonic()
+        while self._running:
+            with self._raw_cond:
+                while self._running and (self._raw is None or self._raw_id == processed_id):
+                    self._raw_cond.wait(timeout=1.0)
+                if not self._running:
+                    break
+                frame = self._raw
+                processed_id = self._raw_id
+
+            color, alpha = self._segmenter.segment(frame)
+            with self._overlay_lock:
+                self._overlay = (color, alpha)
+
+            now = time.monotonic()
+            dt = now - last
+            last = now
+            if dt > 0:
+                self._seg_fps = 0.7 * self._seg_fps + 0.3 * (1.0 / dt)
 
     def snapshot(self, prev_id: int) -> tuple[bytes, int]:
         """Block until a frame newer than prev_id is available."""
-        with self._lock:
+        with self._out_cond:
             while self._latest is None or id(self._latest) == prev_id:
                 if not self._running:
                     return b"", prev_id
-                self._lock.wait(timeout=5)
+                self._out_cond.wait(timeout=5)
             return self._latest, id(self._latest)
 
     def stop(self) -> None:
         self._running = False
-        with self._lock:
-            self._lock.notify_all()
+        with self._raw_cond:
+            self._raw_cond.notify_all()
+        with self._out_cond:
+            self._out_cond.notify_all()
 
 
-def make_handler(broadcaster: Broadcaster):
+def make_handler(pipeline: Pipeline):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -120,7 +181,7 @@ def make_handler(broadcaster: Broadcaster):
             prev = 0
             try:
                 while True:
-                    jpeg, prev = broadcaster.snapshot(prev)
+                    jpeg, prev = pipeline.snapshot(prev)
                     if not jpeg:
                         break
                     self.wfile.write(b"--frame\r\n")
@@ -154,23 +215,35 @@ def main() -> int:
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--framerate", type=int, default=15)
-    parser.add_argument("--alpha", type=float, default=0.5, help="mask opacity 0..1")
+    parser.add_argument("--alpha", type=float, default=0.5, help="mask overlay opacity 0..1")
     parser.add_argument("--quality", type=int, default=80, help="output JPEG quality")
+    parser.add_argument("--model", default="FastSAM-s", help="FastSAM .pt or NCNN model dir")
+    parser.add_argument("--imgsz", type=int, default=512, help="FastSAM inference size (smaller=faster)")
+    parser.add_argument("--conf", type=float, default=0.4, help="FastSAM confidence threshold")
+    parser.add_argument("--iou", type=float, default=0.9, help="FastSAM NMS IoU threshold")
+    parser.add_argument("--retina-masks", action="store_true", help="full-resolution mask edges (slower)")
     args = parser.parse_args()
 
     camera = RpicamMjpegCamera(
         CameraConfig(width=args.width, height=args.height, framerate=args.framerate)
     )
     try:
-        segmenter = Segmenter(alpha=args.alpha)
-    except FileNotFoundError as exc:
+        segmenter = Segmenter(
+            model=args.model,
+            imgsz=args.imgsz,
+            conf=args.conf,
+            iou=args.iou,
+            alpha=args.alpha,
+            retina_masks=args.retina_masks,
+        )
+    except (RuntimeError, FileNotFoundError) as exc:
         print(exc, file=sys.stderr)
         return 1
 
-    broadcaster = Broadcaster(camera, segmenter, jpeg_quality=args.quality)
-    broadcaster.start()
+    pipeline = Pipeline(camera, segmenter, jpeg_quality=args.quality)
+    pipeline.start()
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(broadcaster))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(pipeline))
     url = f"http://{_lan_ip()}:{args.port}/"
     print(f"Serving segmented stream at {url}  (Ctrl-C to stop)")
     try:
@@ -178,7 +251,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
-        broadcaster.stop()
+        pipeline.stop()
         server.shutdown()
         camera.close()
         segmenter.close()

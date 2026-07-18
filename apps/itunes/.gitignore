@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 models/*.tflite
+# FastSAM weights + exports (downloaded/generated, not versioned)
+models/*.pt
+models/*_ncnn_model/
+*.pt
