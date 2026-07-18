@@ -63,11 +63,12 @@ class Segmenter:
     def __init__(
         self,
         model: str = "FastSAM-s",
-        imgsz: int = 512,
+        imgsz: int = 448,
         conf: float = 0.4,
         iou: float = 0.9,
         alpha: float = 0.5,
         retina_masks: bool = False,
+        bg_color: tuple[int, int, int] = (40, 40, 40),
     ):
         try:
             from ultralytics import FastSAM
@@ -82,19 +83,26 @@ class Segmenter:
         self.alpha = float(np.clip(alpha, 0.0, 1.0))
         self.retina_masks = bool(retina_masks)
         self.palette = _build_palette(_PALETTE_SIZE)
+        # Color for pixels no instance mask covers, so the whole frame is blocked.
+        self.bg_color = np.array(bg_color, dtype=np.uint8)
 
         self._model = FastSAM(_resolve_model(model))
 
     def segment(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Run FastSAM and return ``(color_bgr, alpha_map)`` at the frame's size.
 
-        ``color_bgr`` is a (H, W, 3) uint8 image of per-instance colors and
-        ``alpha_map`` is a (H, W) float32 opacity map (0 where nothing is
-        segmented, ``self.alpha`` under a mask). Blend with :meth:`blend`.
+        Every pixel is colored: instance masks get distinct palette colors and
+        all remaining (background) pixels get ``self.bg_color``, so the whole
+        frame is color-blocked. ``alpha_map`` is therefore uniformly
+        ``self.alpha``. Blend with :meth:`blend`.
+
+        Colorization is done via a small integer label map at mask resolution
+        (0 = background, k = the k-th painted instance), resized to the frame
+        size in a single pass and mapped to colors through a lookup table —
+        far cheaper than resizing and indexing each mask at full resolution.
         """
         h, w = frame_bgr.shape[:2]
-        color = np.zeros((h, w, 3), dtype=np.uint8)
-        alpha = np.zeros((h, w), dtype=np.float32)
+        alpha = np.full((h, w), self.alpha, dtype=np.float32)
 
         results = self._model(
             frame_bgr,
@@ -106,22 +114,32 @@ class Segmenter:
             verbose=False,
         )
         if not results or results[0].masks is None:
+            # No instances: the whole frame is one background block.
+            color = np.empty((h, w, 3), dtype=np.uint8)
+            color[:] = self.bg_color
             return color, alpha
 
         masks = results[0].masks.data  # (N, mh, mw) tensor, values in [0, 1]
         masks = np.asarray(masks.cpu().numpy() if hasattr(masks, "cpu") else masks)
+        n, mh, mw = masks.shape
 
-        # Paint largest masks first so smaller objects land on top and stay visible.
-        order = np.argsort([float(m.sum()) for m in masks])[::-1]
+        # Build a label map at mask resolution. Paint largest masks first so
+        # smaller objects land on top (higher label) and stay visible.
+        order = np.argsort(masks.reshape(n, -1).sum(axis=1))[::-1]
+        labels = np.zeros((mh, mw), dtype=np.int32)
         for draw_idx, i in enumerate(order):
-            m = masks[i]
-            if m.shape != (h, w):
-                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
-            region = m > 0.5
-            if not region.any():
-                continue
-            color[region] = self.palette[draw_idx % _PALETTE_SIZE]
-            alpha[region] = self.alpha
+            labels[masks[i] > 0.5] = draw_idx + 1
+
+        # One nearest-neighbor resize of the label map to the frame size.
+        if (mh, mw) != (h, w):
+            labels = cv2.resize(labels, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        # Look up each label's color in a single vectorized pass. Row 0 is the
+        # background; row k is the (k-1)-th palette color (cycled).
+        lut = np.empty((n + 1, 3), dtype=np.uint8)
+        lut[0] = self.bg_color
+        lut[1:] = self.palette[np.arange(n) % _PALETTE_SIZE]
+        color = lut[labels]
 
         return color, alpha
 
