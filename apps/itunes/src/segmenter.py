@@ -1,8 +1,14 @@
-"""Semantic segmentation using MediaPipe's Image Segmenter with DeepLabV3.
+"""SAM-style "segment everything" via FastSAM, colorized per instance.
 
-DeepLabV3 outputs a per-pixel category mask over ~21 Pascal-VOC classes
-(background, person, car, cat, chair, ...). We colorize the category mask and
-alpha-blend it over the source frame.
+FastSAM (a CNN, YOLOv8-seg based) produces prompt-free instance masks for
+everything in a frame in a single forward pass — the practical way to get the
+Segment-Anything "segment everything" look on a Pi 5 CPU. We assign each mask a
+distinct color and composite them into a translucent overlay that the caller
+blends over the live frame.
+
+Output of ``segment()`` is an *overlay* — a color image plus a per-pixel alpha
+map — rather than a finished frame, so a single (slow) segmentation pass can be
+reused across many (fast) live frames by the decoupled broadcaster in main.py.
 """
 
 from __future__ import annotations
@@ -11,80 +17,128 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision
 
-# Pascal-VOC 21-class labels, in DeepLabV3 index order.
-LABELS = (
-    "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus",
-    "car", "cat", "chair", "cow", "diningtable", "dog", "horse", "motorbike",
-    "person", "pottedplant", "sheep", "sofa", "train", "tv",
-)
+_MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
-DEFAULT_MODEL = Path(__file__).resolve().parent.parent / "models" / "deeplab_v3.tflite"
-
-# Native input resolution of the DeepLabV3 model. Segmenting at this size and
-# upscaling the mask keeps CPU latency reasonable on the Pi.
-_MODEL_INPUT = 257
+# How many distinct instance colors to pre-generate before cycling.
+_PALETTE_SIZE = 256
 
 
 def _build_palette(n: int) -> np.ndarray:
-    """Deterministic, visually distinct BGR colors; index 0 (background) is black."""
+    """`n` visually distinct, saturated BGR colors via golden-ratio hue spacing."""
     palette = np.zeros((n, 3), dtype=np.uint8)
-    for i in range(1, n):
-        hue = int(179 * (i / max(n - 1, 1)))
-        hsv = np.uint8([[[hue, 200, 255]]])
+    golden = 0.618033988749895
+    hue = 0.1
+    for i in range(n):
+        hue = (hue + golden) % 1.0
+        hsv = np.uint8([[[int(hue * 179), 200, 255]]])
         palette[i] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
     return palette
 
 
+def _resolve_model(model: str) -> str:
+    """Resolve a model name to a usable path, preferring a fast local NCNN export.
+
+    Order: an explicit existing path → ``models/<name>_ncnn_model`` (fastest on
+    the Pi CPU) → ``models/<name>.pt`` → the bare ``<name>.pt`` (ultralytics
+    auto-downloads it on first use).
+    """
+    p = Path(model)
+    if p.exists():
+        return str(p)
+
+    stem = p.stem if p.suffix == ".pt" else p.name  # "FastSAM-s" from either form
+    ncnn_dir = _MODELS_DIR / f"{stem}_ncnn_model"
+    if ncnn_dir.is_dir():
+        return str(ncnn_dir)
+    local_pt = _MODELS_DIR / f"{stem}.pt"
+    if local_pt.is_file():
+        return str(local_pt)
+    return f"{stem}.pt"
+
+
 class Segmenter:
-    def __init__(self, model_path: Path | str = DEFAULT_MODEL, alpha: float = 0.5):
-        model_path = Path(model_path)
-        if not model_path.exists():
-            raise FileNotFoundError(
-                f"Model not found: {model_path}\n"
-                "Run scripts/download_model.sh first."
-            )
-        self.alpha = float(alpha)
-        self.palette = _build_palette(len(LABELS))
+    """FastSAM segment-everything wrapper producing colorized overlays."""
 
-        options = vision.ImageSegmenterOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=vision.RunningMode.IMAGE,
-            output_category_mask=True,
-            output_confidence_masks=False,
-        )
-        self._segmenter = vision.ImageSegmenter.create_from_options(options)
+    def __init__(
+        self,
+        model: str = "FastSAM-s",
+        imgsz: int = 512,
+        conf: float = 0.4,
+        iou: float = 0.9,
+        alpha: float = 0.5,
+        retina_masks: bool = False,
+    ):
+        try:
+            from ultralytics import FastSAM
+        except ImportError as exc:  # pragma: no cover - env-dependent
+            raise RuntimeError(
+                "ultralytics is required for FastSAM. Install deps with `uv sync`."
+            ) from exc
 
-    def category_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """Return a uint8 category-index mask at the frame's resolution."""
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result = self._segmenter.segment(mp_image)
-        mask = result.category_mask.numpy_view()  # uint8, model resolution
+        self.imgsz = int(imgsz)
+        self.conf = float(conf)
+        self.iou = float(iou)
+        self.alpha = float(np.clip(alpha, 0.0, 1.0))
+        self.retina_masks = bool(retina_masks)
+        self.palette = _build_palette(_PALETTE_SIZE)
+
+        self._model = FastSAM(_resolve_model(model))
+
+    def segment(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Run FastSAM and return ``(color_bgr, alpha_map)`` at the frame's size.
+
+        ``color_bgr`` is a (H, W, 3) uint8 image of per-instance colors and
+        ``alpha_map`` is a (H, W) float32 opacity map (0 where nothing is
+        segmented, ``self.alpha`` under a mask). Blend with :meth:`blend`.
+        """
         h, w = frame_bgr.shape[:2]
-        if mask.shape != (h, w):
-            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-        return mask
+        color = np.zeros((h, w, 3), dtype=np.uint8)
+        alpha = np.zeros((h, w), dtype=np.float32)
 
-    def overlay(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """Blend a colorized segmentation mask over the frame."""
-        mask = self.category_mask(frame_bgr)
-        color_mask = self.palette[mask]  # (H, W, 3)
-        blended = cv2.addWeighted(frame_bgr, 1.0 - self.alpha, color_mask, self.alpha, 0)
+        results = self._model(
+            frame_bgr,
+            imgsz=self.imgsz,
+            conf=self.conf,
+            iou=self.iou,
+            retina_masks=self.retina_masks,
+            device="cpu",
+            verbose=False,
+        )
+        if not results or results[0].masks is None:
+            return color, alpha
 
-        # Leave background pixels (class 0) as the original image.
-        bg = mask == 0
-        blended[bg] = frame_bgr[bg]
-        return blended
+        masks = results[0].masks.data  # (N, mh, mw) tensor, values in [0, 1]
+        masks = np.asarray(masks.cpu().numpy() if hasattr(masks, "cpu") else masks)
 
-    def present_labels(self, mask: np.ndarray) -> list[str]:
-        return [LABELS[i] for i in np.unique(mask) if i < len(LABELS)]
+        # Paint largest masks first so smaller objects land on top and stay visible.
+        order = np.argsort([float(m.sum()) for m in masks])[::-1]
+        for draw_idx, i in enumerate(order):
+            m = masks[i]
+            if m.shape != (h, w):
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+            region = m > 0.5
+            if not region.any():
+                continue
+            color[region] = self.palette[draw_idx % _PALETTE_SIZE]
+            alpha[region] = self.alpha
+
+        return color, alpha
+
+    def blend(
+        self, frame_bgr: np.ndarray, color_bgr: np.ndarray, alpha_map: np.ndarray
+    ) -> np.ndarray:
+        """Composite an overlay from :meth:`segment` onto a (current) frame."""
+        if color_bgr.shape[:2] != frame_bgr.shape[:2]:
+            h, w = frame_bgr.shape[:2]
+            color_bgr = cv2.resize(color_bgr, (w, h), interpolation=cv2.INTER_NEAREST)
+            alpha_map = cv2.resize(alpha_map, (w, h), interpolation=cv2.INTER_NEAREST)
+        a = alpha_map[:, :, None]
+        out = frame_bgr.astype(np.float32) * (1.0 - a) + color_bgr.astype(np.float32) * a
+        return out.astype(np.uint8)
 
     def close(self) -> None:
-        self._segmenter.close()
+        pass
 
     def __enter__(self) -> "Segmenter":
         return self
