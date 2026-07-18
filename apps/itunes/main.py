@@ -218,11 +218,23 @@ def main() -> int:
     parser.add_argument("--alpha", type=float, default=0.5, help="mask overlay opacity 0..1")
     parser.add_argument("--quality", type=int, default=80, help="output JPEG quality")
     parser.add_argument("--model", default="FastSAM-s", help="FastSAM .pt or NCNN model dir")
-    parser.add_argument("--imgsz", type=int, default=512, help="FastSAM inference size (smaller=faster)")
+    parser.add_argument("--imgsz", type=int, default=448, help="FastSAM inference size (smaller=faster)")
     parser.add_argument("--conf", type=float, default=0.4, help="FastSAM confidence threshold")
     parser.add_argument("--iou", type=float, default=0.9, help="FastSAM NMS IoU threshold")
     parser.add_argument("--retina-masks", action="store_true", help="full-resolution mask edges (slower)")
+    parser.add_argument(
+        "--bg-color", default="40,40,40",
+        help="B,G,R color for pixels no mask covers (whole frame stays color-blocked)",
+    )
     args = parser.parse_args()
+
+    try:
+        bg_color = tuple(int(c) for c in args.bg_color.split(","))
+        if len(bg_color) != 3:
+            raise ValueError
+    except ValueError:
+        print("--bg-color must be three comma-separated ints, e.g. 40,40,40", file=sys.stderr)
+        return 1
 
     camera = RpicamMjpegCamera(
         CameraConfig(width=args.width, height=args.height, framerate=args.framerate)
@@ -235,6 +247,7 @@ def main() -> int:
             iou=args.iou,
             alpha=args.alpha,
             retina_masks=args.retina_masks,
+            bg_color=bg_color,
         )
     except (RuntimeError, FileNotFoundError) as exc:
         print(exc, file=sys.stderr)
