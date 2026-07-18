@@ -31,8 +31,10 @@ rpicam-vid (MJPEG) ─► OpenCV decode ─┬─► blend latest overlay ─►
   **ncnn** (fast CPU inference of the NCNN-exported model). Kept `opencv-python`.
 - `requires-python` widened to `>=3.10` (3.13 now possible); the uv venv is still
   3.12 to avoid a rebuild. `numpy` pin relaxed to `>=1.26`.
-- Torch is a heavy dep (hundreds of MB) vs. the old ~3 MB tflite — fine on the
-  8 GB Pi 5. Fallback if size/install bites: FastSAM → ONNX + onnxruntime.
+- Torch is a heavy dep (hundreds of MB) vs. the old ~3 MB tflite. **This Pi 5 is
+  the 4 GB model** — torch + FastSAM peaks ~1–1.5 GB RAM, which fits but with less
+  headroom: prefer the NCNN path (lower runtime RAM than `.pt`), keep `--imgsz` ≤512,
+  keep swap on. Fallback if size/RAM bites: FastSAM → ONNX + onnxruntime (drops torch).
 
 ## How to use
 

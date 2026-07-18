@@ -26,7 +26,7 @@ pipeline is **decoupled**:
 
 ## Prerequisites
 
-- Raspberry Pi 5 (8 GB recommended — torch/ultralytics are heavy), Pi camera
+- Raspberry Pi 5 (4 GB works; torch/ultralytics are heavy — see the memory note below), Pi camera
   (tested: Camera Module 3 NoIR / `imx708`)
 - `rpicam-apps` (`rpicam-vid` on PATH — already present on Raspberry Pi OS)
 - [`uv`](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
@@ -86,3 +86,8 @@ refresh, raise it (e.g. 640) for sharper masks. Video stays smooth regardless.
   either `FastSAM-s_ncnn_model/` or `FastSAM-s.pt`.
 - **Masks refresh slowly / lag a lot** — expected on CPU. Lower `--imgsz`, or drop
   `--width/--height`. The video itself stays smooth; only the mask overlay lags.
+- **Killed / `MemoryError` / OOM on a 4 GB Pi** — torch + FastSAM peaks around ~1–1.5 GB.
+  Prefer the **NCNN** model path (`scripts/setup_model.sh`; much lower runtime RAM than
+  the `.pt` torch path), keep `--imgsz` modest (≤512), close other apps, and make sure
+  swap is on (`sudo dphys-swapfile` — 2 GB is plenty of headroom). If it still won't fit,
+  the fallback is FastSAM → ONNX + onnxruntime (drops the torch runtime entirely).
