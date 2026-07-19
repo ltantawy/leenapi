@@ -86,7 +86,7 @@ class Segmenter:
     def __init__(
         self,
         model: str = "FastSAM-s",
-        imgsz: int = 448,
+        imgsz: int = 320,
         conf: float = 0.4,
         iou: float = 0.9,
         alpha: float = 0.5,
