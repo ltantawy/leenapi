@@ -26,6 +26,16 @@ stop that, a lightweight tracker matches this frame's masks to recent ones by
 centroid + area and carries each track's color forward; a track survives a few
 missed frames (a grace period) so a momentary FastSAM dropout does not recolor
 a region. Color thus follows a region's identity, not its per-frame rank.
+
+**Temporal presence stability (anti-flicker).** Stable color identity is not
+enough: FastSAM rebuilds its masks from scratch each pass, so a region it
+momentarily misses flips to the background block and back (a purple<->white
+pulse) and mask boundaries shimmer. A pixel-level persistence layer smooths the
+*displayed color over time* — it EMA-blends toward the new color where a region
+is present (so real motion still tracks) and *holds* a region's last color for a
+few passes when it briefly drops out before fading to background. A single
+``stability`` knob in [0, 1] scales this (0 = off/crisp, higher = more static);
+it runs at mask resolution so it costs about a millisecond per pass.
 """
 
 from __future__ import annotations
@@ -66,6 +76,24 @@ _GRID = 24  # cells per axis over the normalized frame
 # so colors persist across extended dropouts; expires eventually so a genuinely
 # changed scene can recolor rather than being pinned forever.
 _GRID_MAX_AGE = 150
+
+# --- Pixel-level temporal persistence (anti-flicker) ---
+# The tracker/grid stabilize a region's *color identity*, but the mask a region
+# occupies is rebuilt from scratch every pass from whatever FastSAM returns, so
+# a region FastSAM momentarily misses flips to the background block and back
+# (purple<->white pulsing) and mask boundaries shimmer pass to pass. Persistence
+# smooths the *displayed color per pixel* over time: it EMA-blends toward the new
+# color where a region is present and *holds* a region's last color for a few
+# passes when it briefly drops out, only then fading to background. This runs at
+# mask resolution (~320x320) so it costs ~1 ms/pass. A single ``stability`` knob
+# in [0, 1] scales it; these are the endpoints it interpolates between.
+# Blend fraction toward the new color where an instance is present. 1.0 = snap
+# (no smoothing, old behavior); lower = softer, more static edges.
+_PERSIST_FG_BETA_MIN = 0.30  # at stability = 1 (most static)
+# Passes to hold a dropped region's color before it starts fading to background.
+_PERSIST_HOLD_MAX = 6  # at stability = 1
+# Blend fraction toward background once a held region finally fades out.
+_PERSIST_BG_BETA_MIN = 0.40  # at stability = 1
 
 
 def _build_palette(n: int) -> np.ndarray:
@@ -170,6 +198,7 @@ class Segmenter:
         bg_color: tuple[int, int, int] = (255, 255, 255),
         bg_alpha: float = 0.85,
         overlay: bool = False,
+        stability: float = 0.5,
     ):
         try:
             from ultralytics import FastSAM
@@ -191,6 +220,22 @@ class Segmenter:
         self.bg_alpha = float(np.clip(bg_alpha, 0.0, 1.0))
         # blocks mode (default): render solid color, no live video underneath.
         self.overlay = bool(overlay)
+
+        # Pixel-level temporal persistence (anti-flicker). ``stability`` in
+        # [0, 1] interpolates the endpoints above: 0 disables it entirely (each
+        # pass shown as-is, crisp but flickery); higher holds regions through
+        # FastSAM dropouts and smooths boundaries, trading a little
+        # responsiveness (a brief fading trail behind fast motion) for a much
+        # more static picture. ``_sm_color`` is the accumulated color and
+        # ``_sm_age`` the passes-since-present per pixel, both at mask resolution
+        # and rebuilt if that resolution changes.
+        self.stability = float(np.clip(stability, 0.0, 1.0))
+        s = self.stability
+        self._sm_fg_beta = 1.0 - (1.0 - _PERSIST_FG_BETA_MIN) * s
+        self._sm_hold = int(round(_PERSIST_HOLD_MAX * s))
+        self._sm_bg_beta = 1.0 - (1.0 - _PERSIST_BG_BETA_MIN) * s
+        self._sm_color: np.ndarray | None = None  # (mh, mw, 3) float32
+        self._sm_age: np.ndarray | None = None  # (mh, mw) int32
 
         # Temporal color tracker state. Each track: (cy, cx, area, color_id,
         # missed). color_id indexes the palette (cycled) and is what keeps a
@@ -309,6 +354,70 @@ class Segmenter:
         expired = self._grid_age > _GRID_MAX_AGE
         self._grid_color[expired] = -1
 
+    def _persist(self, color_small: np.ndarray, fg: np.ndarray) -> np.ndarray:
+        """Temporally smooth the per-pixel color to kill drop-in/out flicker.
+
+        ``color_small`` is this pass's color image and ``fg`` a boolean mask of
+        which pixels an instance covers, both at mask resolution. Where a region
+        is present the accumulated color EMA-blends toward the new color (fast,
+        so real motion still tracks); where a region just dropped out the old
+        color is *held* for ``_sm_hold`` passes before fading to background, so a
+        momentary FastSAM miss no longer flashes the block to white. Returns the
+        smoothed color at mask resolution. With ``stability == 0`` this is a
+        no-op passthrough (crisp but flickery, the original behavior).
+        """
+        if self.stability <= 0.0:
+            return color_small
+
+        c = color_small.astype(np.float32)
+        if (
+            self._sm_color is None
+            or self._sm_color.shape != c.shape
+            or self._sm_age is None
+        ):
+            # First pass (or resolution changed): seed the accumulator. Pixels
+            # already background start past the hold so they are not held.
+            self._sm_color = c.copy()
+            self._sm_age = np.where(fg, 0, self._sm_hold + 1).astype(np.int32)
+            return color_small
+
+        sm = self._sm_color
+        age = self._sm_age
+
+        # Present pixels: blend toward the new color, reset their idle age.
+        sm[fg] += self._sm_fg_beta * (c[fg] - sm[fg])
+        age[fg] = 0
+
+        # Absent pixels: age them. Within the hold window keep the old color
+        # (the region is treated as a brief dropout); past it, fade to bg.
+        bg = ~fg
+        age[bg] += 1
+        fade = bg & (age > self._sm_hold)
+        if fade.any():
+            bg_col = self.bg_color.astype(np.float32)
+            sm[fade] += self._sm_bg_beta * (bg_col - sm[fade])
+
+        self._sm_color = sm
+        self._sm_age = age
+        return np.clip(sm, 0.0, 255.0).astype(np.uint8)
+
+    @staticmethod
+    def _deletterbox_color(img: np.ndarray, h: int, w: int) -> np.ndarray:
+        """De-letterbox a mask-resolution color image back to the frame size.
+
+        Mirrors :func:`_deletterbox_to` but for a 3-channel color image resized
+        with INTER_LINEAR (the persisted colors are already soft, so a linear
+        resize keeps stable, smooth block edges).
+        """
+        mh, mw = img.shape[:2]
+        if (mh, mw) == (h, w):
+            return img
+        r = min(mh / h, mw / w)
+        uh, uw = round(h * r), round(w * r)
+        top, left = (mh - uh) // 2, (mw - uw) // 2
+        crop = np.ascontiguousarray(img[top : top + uh, left : left + uw])
+        return cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+
     def segment(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Run FastSAM and return ``(color_bgr, alpha_map)`` at the frame's size.
 
@@ -338,8 +447,14 @@ class Segmenter:
 
         masks = None if not results else results[0].masks
         if masks is None:
-            # No instances: the whole frame is one solid background block.
-            labels = np.zeros((h, w), dtype=np.int32)
+            # No instances this pass. Keep the label map at the persistence
+            # accumulator's resolution (so held regions can still fade out) if we
+            # have one; otherwise the frame is one solid background block.
+            if self.stability > 0.0 and self._sm_color is not None:
+                mh, mw = self._sm_color.shape[:2]
+            else:
+                mh, mw = h, w
+            labels = np.zeros((mh, mw), dtype=np.int32)
             color_ids = np.empty(0, dtype=np.int64)
             n = 0
         else:
@@ -363,9 +478,6 @@ class Segmenter:
                 labels[masks_bool[i]] = draw_idx + 1
                 slot_color[draw_idx] = color_ids[i]
             color_ids = slot_color
-            # Undo the model's letterbox padding and map back to the frame in a
-            # single pass, so masks align to the real image (not a middle band).
-            labels = _deletterbox_to(labels, h, w)
 
         # Map labels -> color and opacity in single vectorized passes. Row 0 is
         # the background; row k is the tracked color of the k-th painted slot.
@@ -381,8 +493,21 @@ class Segmenter:
             # blocks mode: solid everywhere, no live video underneath.
             alpha_lut = np.ones(n + 1, dtype=np.float32)
 
-        color = color_lut[labels]
-        alpha = alpha_lut[labels]
+        if self.stability > 0.0:
+            # Anti-flicker: color at mask resolution, temporally smooth (hold
+            # dropouts, ease boundaries), then de-letterbox the smoothed color to
+            # the frame. Alpha follows the crisp current labels (all ones in
+            # blocks mode, so the held colors show at full strength).
+            color_small = color_lut[labels]
+            fg = labels > 0
+            color_small = self._persist(color_small, fg)
+            color = self._deletterbox_color(color_small, h, w)
+            alpha = alpha_lut[_deletterbox_to(labels, h, w)]
+        else:
+            # Original crisp path: de-letterbox labels, then map to color/alpha.
+            labels = _deletterbox_to(labels, h, w)
+            color = color_lut[labels]
+            alpha = alpha_lut[labels]
         return color, alpha
 
     def blend(
