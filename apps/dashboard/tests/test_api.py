@@ -71,3 +71,10 @@ def test_text_is_trimmed(client):
     response = client.post("/api/todos", json={"text": "  spaced  "})
 
     assert response.get_json()["text"] == "spaced"
+
+
+def test_phone_page_renders(client):
+    response = client.get("/phone")
+
+    assert response.status_code == 200
+    assert b"<form" in response.data
