@@ -38,3 +38,44 @@ def test_data_survives_reopening_the_database(tmp_path):
     reopened = Store(path)
 
     assert [t.text for t in reopened.list()] == ["remember me"]
+
+
+def test_toggle_marks_a_todo_done(store):
+    todo = store.add("water plants")
+
+    store.toggle(todo.id)
+
+    assert store.list()[0].done is True
+
+
+def test_toggle_twice_returns_to_not_done(store):
+    todo = store.add("water plants")
+
+    store.toggle(todo.id)
+    store.toggle(todo.id)
+
+    assert store.list()[0].done is False
+
+
+def test_delete_removes_the_todo(store):
+    todo = store.add("obsolete")
+
+    store.delete(todo.id)
+
+    assert store.list() == []
+
+
+def test_toggle_unknown_id_is_a_no_op(store):
+    store.add("untouched")
+
+    store.toggle(9999)
+
+    assert store.list()[0].done is False
+
+
+def test_delete_unknown_id_is_a_no_op(store):
+    store.add("untouched")
+
+    store.delete(9999)
+
+    assert len(store.list()) == 1

@@ -76,3 +76,15 @@ class Store:
             )
             for row in rows
         ]
+
+    def toggle(self, todo_id: int) -> None:
+        """Flip the done flag. Unknown ids are ignored — a stale phone tab
+        deleting then toggling should not 500."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE todos SET done = 1 - done WHERE id = ?", (todo_id,)
+            )
+
+    def delete(self, todo_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
