@@ -11,6 +11,13 @@ dependencies = [
     "numpy>=1.26",
 ]
 
+[project.optional-dependencies]
+# Build-time only: the `pnnx` converter is needed to export the .pt model to
+# NCNN (scripts/setup_model.sh). Not needed at runtime, hence an extra.
+export = [
+    "pnnx",
+]
+
 [tool.uv]
 # The uv-managed 3.12 venv is retained; torch/ultralytics also support 3.13 now
 # that MediaPipe's cp312-only constraint is gone.

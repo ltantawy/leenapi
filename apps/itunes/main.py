@@ -218,13 +218,17 @@ def main() -> int:
     parser.add_argument("--alpha", type=float, default=0.5, help="mask overlay opacity 0..1")
     parser.add_argument("--quality", type=int, default=80, help="output JPEG quality")
     parser.add_argument("--model", default="FastSAM-s", help="FastSAM .pt or NCNN model dir")
-    parser.add_argument("--imgsz", type=int, default=448, help="FastSAM inference size (smaller=faster)")
+    parser.add_argument("--imgsz", type=int, default=320, help="FastSAM inference size (smaller=faster)")
     parser.add_argument("--conf", type=float, default=0.4, help="FastSAM confidence threshold")
     parser.add_argument("--iou", type=float, default=0.9, help="FastSAM NMS IoU threshold")
     parser.add_argument("--retina-masks", action="store_true", help="full-resolution mask edges (slower)")
     parser.add_argument(
         "--bg-color", default="40,40,40",
         help="B,G,R color for pixels no mask covers (whole frame stays color-blocked)",
+    )
+    parser.add_argument(
+        "--bg-alpha", type=float, default=0.85,
+        help="opacity of the background block (higher=more solid fill, less see-through)",
     )
     args = parser.parse_args()
 
@@ -248,6 +252,7 @@ def main() -> int:
             alpha=args.alpha,
             retina_masks=args.retina_masks,
             bg_color=bg_color,
+            bg_alpha=args.bg_alpha,
         )
     except (RuntimeError, FileNotFoundError) as exc:
         print(exc, file=sys.stderr)
