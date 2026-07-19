@@ -1,0 +1,20 @@
+[project]
+name = "dashboard"
+version = "0.1.0"
+description = "Wall display for a Raspberry Pi 5: todo list on the monitor, editable from a phone"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "flask>=3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Without this, pytest puts tests/ on sys.path but not the project root, and
+# `from src.store import Store` fails with ModuleNotFoundError.
+pythonpath = ["."]
