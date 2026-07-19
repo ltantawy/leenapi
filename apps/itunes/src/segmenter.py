@@ -36,6 +36,16 @@ is present (so real motion still tracks) and *holds* a region's last color for a
 few passes when it briefly drops out before fading to background. A single
 ``stability`` knob in [0, 1] scales this (0 = off/crisp, higher = more static);
 it runs at mask resolution so it costs about a millisecond per pass.
+
+**Vector edges (anti-pixelation).** FastSAM returns masks at the model input
+size (320x320 by default, letterboxed), so painting them by upscaling a label
+map to the frame turns every boundary into a hard 4-pixel staircase — the
+blocks look pixelated. Instead the mask *outlines* are traced at mask
+resolution, simplified and corner-rounded as polygons, mapped into continuous
+frame coordinates and filled at full frame resolution with subpixel,
+anti-aliased edges. Because the smoothing happens on polygon points rather than
+pixels it is resolution independent: the blocks scale up as shapes, not as
+pixels, and their corners are genuinely rounded rather than blurred.
 """
 
 from __future__ import annotations
@@ -96,6 +106,87 @@ _PERSIST_HOLD_MAX = 6  # at stability = 1
 _PERSIST_BG_BETA_MIN = 0.40  # at stability = 1
 
 
+# --- Vector edge rendering (anti-pixelation) ---
+# Masks arrive at the model input size (e.g. 320x320) and are painted onto a
+# much larger frame (e.g. 1280x720), so a nearest-neighbour label upscale shows
+# a hard ~4 px staircase on every boundary. Rendering the mask outlines as
+# polygons instead makes the upscale resolution-independent. Two point-space
+# operations do the smoothing, both costing microseconds on the few hundred
+# points a contour has:
+#   1. Douglas-Peucker simplification, which removes the single-pixel staircase
+#      itself (the source of the "pixelated" look).
+#   2. Chaikin corner cutting, which replaces each remaining corner with two
+#      points a quarter in from it -- repeated, this converges to a smooth
+#      quadratic B-spline, i.e. genuinely rounded edges.
+# Both are scaled by the ``edge_smooth`` knob in [0, 1]; these are its endpoints.
+_VEC_EPS_MIN, _VEC_EPS_MAX = 0.4, 2.0  # approxPolyDP epsilon, in mask pixels
+_VEC_ITERS_MIN, _VEC_ITERS_MAX = 1, 3  # Chaikin iterations (each doubles points)
+# Cap on how far a corner cut may reach along an edge, in mask pixels: this is
+# effectively the corner radius. Bounded rather than proportional so long
+# straight edges survive smoothing intact (see _chaikin).
+_VEC_CUT_MIN, _VEC_CUT_MAX = 1.0, 4.0
+# Contours smaller than this fraction of the mask canvas are dropped as specks;
+# they are single-pixel noise that no amount of smoothing makes look good.
+_VEC_MIN_AREA_FRAC = 2e-4
+# Chaikin only ever moves points inward (each new point is a convex combination
+# of two old ones), so smoothing shrinks every shape slightly and the hairline
+# gaps between neighbouring masks widen into visible background seams -- which
+# would undo the "every pixel inside a colored block" fill. Growing each mask by
+# a pixel before tracing cancels the shrink; neighbours then overlap slightly
+# instead of parting, and draw order (largest first) resolves the overlap.
+_VEC_GROW = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+# Fixed-point fraction bits for fillPoly's ``shift``: polygon coordinates are
+# passed as 1/8-pixel integers so edges land on subpixel positions instead of
+# snapping to the pixel grid (which would reintroduce the staircase).
+_VEC_SHIFT = 3
+
+
+def _chaikin(pts: np.ndarray, iters: int, max_cut: float | None = None) -> np.ndarray:
+    """Round a *closed* polygon's corners by Chaikin corner cutting.
+
+    Each iteration replaces every edge with two points a fraction in from its
+    ends, cutting each corner off. Iterated, the polygon converges to a smooth
+    quadratic B-spline, so corners become rounded arcs rather than sharp
+    vertices. Point count doubles per iteration, which is why the contour is
+    simplified first and the iteration count is small.
+
+    ``max_cut`` (in the same units as the points) caps how far a cut may reach
+    along an edge. Textbook Chaikin cuts a fixed *fraction* (1/4) of every edge,
+    which is fine for a contour with many short edges but badly deforms a simple
+    shape: three iterations on a plain rectangle pull its long sides inward and
+    collapse it toward a blob, shrinking the region and opening gaps against its
+    neighbours. Capping the cut at a fixed distance makes the corner radius
+    bounded instead of proportional, so long straight edges stay put and only
+    the corners actually round.
+    """
+    for _ in range(iters):
+        if len(pts) < 3:
+            break
+        nxt = np.roll(pts, -1, axis=0)
+        edge = nxt - pts
+        if max_cut is None:
+            t = 0.25
+        else:
+            length = np.hypot(edge[:, 0], edge[:, 1])
+            t = np.minimum(0.25, max_cut / np.maximum(length, 1e-6))[:, None]
+        out = np.empty((len(pts) * 2, 2), dtype=np.float32)
+        out[0::2] = pts + edge * t
+        out[1::2] = pts + edge * (1.0 - t)
+        pts = out
+    return pts
+
+
+def _smooth_poly(
+    pts: np.ndarray, eps: float, iters: int, max_cut: float | None = None
+) -> np.ndarray:
+    """Simplify away the pixel staircase, then round what is left."""
+    if len(pts) > 4 and eps > 0:
+        approx = cv2.approxPolyDP(pts.reshape(-1, 1, 2), eps, True)
+        if len(approx) >= 3:
+            pts = approx[:, 0, :].astype(np.float32)
+    return _chaikin(pts, iters, max_cut)
+
+
 def _build_palette(n: int) -> np.ndarray:
     """`n` distinct **shades of purple** as BGR colors.
 
@@ -121,6 +212,19 @@ def _build_palette(n: int) -> np.ndarray:
     return palette
 
 
+def _letterbox_params(mh: int, mw: int, h: int, w: int) -> tuple[int, int, int, int]:
+    """Where the real frame content sits inside a padded ``(mh, mw)`` mask.
+
+    Returns ``(top, left, uh, uw)``: the offset and size of the unpadded content
+    region. FastSAM aspect-fits the frame into a square canvas at the model input
+    size, so a 1280x720 frame in a 320x320 mask occupies the middle 320x180 rows
+    with padding above and below.
+    """
+    r = min(mh / h, mw / w)  # scale used to fit the frame into the mask canvas
+    uh, uw = round(h * r), round(w * r)
+    return (mh - uh) // 2, (mw - uw) // 2, uh, uw
+
+
 def _deletterbox_to(labels: np.ndarray, h: int, w: int) -> np.ndarray:
     """Map a label map at the model's (letterboxed) mask size back to the frame.
 
@@ -135,9 +239,7 @@ def _deletterbox_to(labels: np.ndarray, h: int, w: int) -> np.ndarray:
     mh, mw = labels.shape
     if (mh, mw) == (h, w):
         return labels
-    r = min(mh / h, mw / w)  # scale used to fit the frame into the mask canvas
-    uh, uw = round(h * r), round(w * r)  # unpadded content size within the mask
-    top, left = (mh - uh) // 2, (mw - uw) // 2
+    top, left, uh, uw = _letterbox_params(mh, mw, h, w)
     crop = labels[top : top + uh, left : left + uw]
     crop = np.ascontiguousarray(crop)
     return cv2.resize(crop, (w, h), interpolation=cv2.INTER_NEAREST)
@@ -199,6 +301,8 @@ class Segmenter:
         bg_alpha: float = 0.85,
         overlay: bool = False,
         stability: float = 0.5,
+        vector: bool = True,
+        edge_smooth: float = 0.5,
     ):
         try:
             from ultralytics import FastSAM
@@ -236,6 +340,23 @@ class Segmenter:
         self._sm_bg_beta = 1.0 - (1.0 - _PERSIST_BG_BETA_MIN) * s
         self._sm_color: np.ndarray | None = None  # (mh, mw, 3) float32
         self._sm_age: np.ndarray | None = None  # (mh, mw) int32
+        # Scratch reused every pass so persistence allocates nothing; sized on
+        # first use (and resized if the resolution changes).
+        self._sm_fade: np.ndarray | None = None
+        self._sm_bg_img: np.ndarray | None = None
+
+        # Vector edge rendering: trace the masks as polygons and fill them at
+        # frame resolution with rounded, anti-aliased edges instead of upscaling
+        # a label map (which stair-steps). ``edge_smooth`` in [0, 1] scales how
+        # aggressively the outlines are simplified and corner-rounded: 0 keeps
+        # them faithful to the mask (still anti-aliased and subpixel, just not
+        # rounded), 1 is soft and blobby.
+        self.vector = bool(vector)
+        self.edge_smooth = float(np.clip(edge_smooth, 0.0, 1.0))
+        e = self.edge_smooth
+        self._vec_eps = _VEC_EPS_MIN + (_VEC_EPS_MAX - _VEC_EPS_MIN) * e
+        self._vec_iters = int(round(_VEC_ITERS_MIN + (_VEC_ITERS_MAX - _VEC_ITERS_MIN) * e))
+        self._vec_cut = _VEC_CUT_MIN + (_VEC_CUT_MAX - _VEC_CUT_MIN) * e
 
         # Temporal color tracker state. Each track: (cy, cx, area, color_id,
         # missed). color_id indexes the palette (cycled) and is what keeps a
@@ -363,43 +484,78 @@ class Segmenter:
         so real motion still tracks); where a region just dropped out the old
         color is *held* for ``_sm_hold`` passes before fading to background, so a
         momentary FastSAM miss no longer flashes the block to white. Returns the
-        smoothed color at mask resolution. With ``stability == 0`` this is a
+        smoothed color at the input resolution. With ``stability == 0`` this is a
         no-op passthrough (crisp but flickery, the original behavior).
+
+        With vector edges this runs at full frame resolution (~1 MPx) rather than
+        mask resolution (~0.1 MPx), so how it is expressed matters: the same
+        maths written as numpy array arithmetic churns tens of MB of float32
+        temporaries per pass, which on the Pi's memory bandwidth costs more than
+        the FastSAM forward pass itself.
+
+        The two blends are therefore done with ``cv2.accumulateWeighted``, which
+        is exactly this operation (``acc = acc*(1-a) + src*a`` under a mask) in a
+        single NEON-optimized pass with no intermediates. The three cases fall
+        out of two masked calls:
+
+        =========  ==========================================
+        pixel      update
+        =========  ==========================================
+        present    blend toward the new color at ``fg_beta``
+        held       untouched by either mask -- color frozen
+        faded      blend toward ``bg_color`` at ``bg_beta``
+        =========  ==========================================
+
+        Both are convex blends between values already in [0, 255], so the
+        accumulator cannot leave that range and needs no clipping.
         """
         if self.stability <= 0.0:
             return color_small
 
-        c = color_small.astype(np.float32)
         if (
             self._sm_color is None
-            or self._sm_color.shape != c.shape
+            or self._sm_color.shape != color_small.shape
             or self._sm_age is None
         ):
-            # First pass (or resolution changed): seed the accumulator. Pixels
-            # already background start past the hold so they are not held.
-            self._sm_color = c.copy()
+            # First pass (or resolution changed): seed the accumulator and the
+            # scratch buffers. Pixels already background start past the hold so
+            # they are not held.
+            self._sm_color = color_small.astype(np.float32)
             self._sm_age = np.where(fg, 0, self._sm_hold + 1).astype(np.int32)
+            self._sm_fade = np.empty(fg.shape, dtype=bool)
+            self._sm_bg_img = np.empty_like(color_small)
+            self._sm_bg_img[:] = self.bg_color
             return color_small
 
         sm = self._sm_color
         age = self._sm_age
+        fade = self._sm_fade
 
-        # Present pixels: blend toward the new color, reset their idle age.
-        sm[fg] += self._sm_fg_beta * (c[fg] - sm[fg])
-        age[fg] = 0
+        # Age every pixel, then reset the ones an instance covers.
+        age += 1
+        np.copyto(age, 0, where=fg)
 
-        # Absent pixels: age them. Within the hold window keep the old color
-        # (the region is treated as a brief dropout); past it, fade to bg.
-        bg = ~fg
-        age[bg] += 1
-        fade = bg & (age > self._sm_hold)
-        if fade.any():
-            bg_col = self.bg_color.astype(np.float32)
-            sm[fade] += self._sm_bg_beta * (bg_col - sm[fade])
+        # Faded = absent for longer than the hold window (pixels an instance
+        # covers were just reset to 0, so they never qualify). Anything absent
+        # but still inside the window is a brief FastSAM dropout: it matches
+        # neither mask below and keeps its color untouched.
+        np.greater(age, self._sm_hold, out=fade)
 
-        self._sm_color = sm
-        self._sm_age = age
-        return np.clip(sm, 0.0, 255.0).astype(np.uint8)
+        # Boolean arrays are one byte per element, so viewing them as uint8 hands
+        # OpenCV a valid 0/1 mask with no copy.
+        cv2.accumulateWeighted(
+            color_small, sm, self._sm_fg_beta, mask=fg.view(np.uint8)
+        )
+        cv2.accumulateWeighted(
+            self._sm_bg_img, sm, self._sm_bg_beta, mask=fade.view(np.uint8)
+        )
+
+        # convertScaleAbs rounds and saturates in one NEON pass, and returns a
+        # fresh array -- which the caller needs: the crossfade in main.py holds
+        # the previous pass's overlay while this one is computed, so handing back
+        # a reused buffer would let the next pass overwrite the frame being faded
+        # *from* and collapse the crossfade.
+        return cv2.convertScaleAbs(sm)
 
     @staticmethod
     def _deletterbox_color(img: np.ndarray, h: int, w: int) -> np.ndarray:
@@ -412,11 +568,109 @@ class Segmenter:
         mh, mw = img.shape[:2]
         if (mh, mw) == (h, w):
             return img
-        r = min(mh / h, mw / w)
-        uh, uw = round(h * r), round(w * r)
-        top, left = (mh - uh) // 2, (mw - uw) // 2
+        top, left, uh, uw = _letterbox_params(mh, mw, h, w)
         crop = np.ascontiguousarray(img[top : top + uh, left : left + uw])
         return cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    def _vector_render(
+        self,
+        masks_bool: np.ndarray,
+        order: np.ndarray,
+        slot_color: np.ndarray,
+        h: int,
+        w: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Paint the masks at frame size as smooth polygons, not upscaled pixels.
+
+        Each mask is traced at mask resolution, its outline simplified and
+        corner-rounded in point space, then mapped into *continuous* frame
+        coordinates and filled with anti-aliased subpixel edges. The result is a
+        full-size color image whose block boundaries are smooth curves rather
+        than a stair-stepped upscale of a 320-pixel label map.
+
+        Masks are drawn in ``order`` (largest first) so smaller objects land on
+        top, matching the label-map path's occlusion. All of one instance's
+        contours are filled in a single call so its holes are cut out correctly
+        (fillPoly resolves overlapping contours with the even-odd rule).
+
+        Returns ``(color_bgr, fg)`` at frame size, where ``fg`` marks pixels an
+        instance covers (everything else is ``bg_color``).
+        """
+        mh, mw = masks_bool.shape[1:]
+        top, left, uh, uw = _letterbox_params(mh, mw, h, w)
+        # Mask pixel centers -> frame pixel centers. The half-pixel terms keep
+        # the two grids concentric, so shapes do not drift by half a block.
+        sx, sy = w / float(uw), h / float(uh)
+        scale = float(1 << _VEC_SHIFT)
+
+        color = np.empty((h, w, 3), dtype=np.uint8)
+        color[:] = self.bg_color
+        fg = np.zeros((h, w), dtype=np.uint8)
+        min_area = _VEC_MIN_AREA_FRAC * mh * mw
+
+        for draw_idx, i in enumerate(order):
+            m = cv2.dilate(masks_bool[i].astype(np.uint8), _VEC_GROW)
+            contours, _ = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            polys = []
+            for cnt in contours:
+                if cv2.contourArea(cnt) < min_area:
+                    continue  # speck: single-pixel noise, not a region
+                pts = _smooth_poly(
+                    cnt[:, 0, :].astype(np.float32),
+                    self._vec_eps,
+                    self._vec_iters,
+                    self._vec_cut,
+                )
+                if len(pts) < 3:
+                    continue
+                pts[:, 0] = (pts[:, 0] - left + 0.5) * sx - 0.5
+                pts[:, 1] = (pts[:, 1] - top + 0.5) * sy - 0.5
+                polys.append(np.rint(pts * scale).astype(np.int32))
+            if not polys:
+                continue
+            bgr = self.palette[int(slot_color[draw_idx]) % _PALETTE_SIZE]
+            cv2.fillPoly(
+                color, polys, (int(bgr[0]), int(bgr[1]), int(bgr[2])),
+                lineType=cv2.LINE_AA, shift=_VEC_SHIFT,
+            )
+            # Coverage mask for alpha/persistence. Drawn hard-edged (no AA) so it
+            # stays strictly binary; the smooth edge lives in the color image.
+            cv2.fillPoly(fg, polys, 255, lineType=cv2.LINE_8, shift=_VEC_SHIFT)
+
+        return color, fg.astype(bool)
+
+    def _segment_vector(self, masks, h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
+        """Vector path: stable colors, then polygon-filled smooth blocks."""
+        data = masks.data  # (N, mh, mw) tensor, values in [0, 1]
+        data = np.asarray(data.cpu().numpy() if hasattr(data, "cpu") else data)
+        masks_bool = data > 0.5
+
+        cy, cx, area = _centroids_areas(masks_bool)
+        color_ids = self._assign_colors(cy, cx, area)
+
+        # Largest first so smaller objects are drawn on top and stay visible.
+        # Draw order sets occlusion only; the color comes from the tracker.
+        order = np.argsort(area)[::-1]
+        color, fg = self._vector_render(masks_bool, order, color_ids[order], h, w)
+        return self._finish_vector(color, fg)
+
+    def _finish_vector(
+        self, color: np.ndarray, fg: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply temporal persistence and build the alpha map for a vector render.
+
+        Persistence runs on the already anti-aliased full-size image, so the
+        smooth edges are what gets held and blended across passes — boundaries
+        ease between shapes instead of snapping.
+        """
+        if self.stability > 0.0:
+            color = self._persist(color, fg)
+        if self.overlay:
+            alpha = np.where(fg, self.alpha, self.bg_alpha).astype(np.float32)
+        else:
+            # blocks mode: solid everywhere, no live video underneath.
+            alpha = np.ones(fg.shape, dtype=np.float32)
+        return color, alpha
 
     def segment(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Run FastSAM and return ``(color_bgr, alpha_map)`` at the frame's size.
@@ -427,11 +681,14 @@ class Segmenter:
         overlay mode background is blended at ``self.bg_alpha`` and instances at
         ``self.alpha``.
 
-        Colorization is done via a small integer label map at mask resolution
-        (0 = background, k = the k-th painted instance), resized to the frame
-        size in a single pass and mapped to colors/opacity through lookup
-        tables — far cheaper than resizing and indexing each mask at full
-        resolution.
+        With ``vector`` on (the default) the masks are traced and filled as
+        smooth polygons at frame resolution, so block edges are rounded and
+        anti-aliased rather than a stair-stepped upscale of the mask grid.
+
+        With ``vector`` off, colorization goes through a small integer label map
+        at mask resolution (0 = background, k = the k-th painted instance),
+        resized to the frame size in a single pass and mapped to colors/opacity
+        through lookup tables — cheaper, but visibly pixelated.
         """
         h, w = frame_bgr.shape[:2]
 
@@ -446,6 +703,15 @@ class Segmenter:
         )
 
         masks = None if not results else results[0].masks
+        if masks is not None and self.vector:
+            return self._segment_vector(masks, h, w)
+        if masks is None and self.vector:
+            # No instances: a solid background frame, still run through
+            # persistence so held regions fade out rather than snapping to bg.
+            color = np.empty((h, w, 3), dtype=np.uint8)
+            color[:] = self.bg_color
+            fg = np.zeros((h, w), dtype=bool)
+            return self._finish_vector(color, fg)
         if masks is None:
             # No instances this pass. Keep the label map at the persistence
             # accumulator's resolution (so held regions can still fade out) if we
@@ -520,7 +786,9 @@ class Segmenter:
         """
         if color_bgr.shape[:2] != frame_bgr.shape[:2]:
             h, w = frame_bgr.shape[:2]
-            color_bgr = cv2.resize(color_bgr, (w, h), interpolation=cv2.INTER_NEAREST)
+            # Linear for color so a size mismatch does not reintroduce the
+            # blocky edges the vector renderer exists to remove.
+            color_bgr = cv2.resize(color_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
             alpha_map = cv2.resize(alpha_map, (w, h), interpolation=cv2.INTER_NEAREST)
         a = alpha_map[:, :, None]
         out = frame_bgr.astype(np.float32) * (1.0 - a) + color_bgr.astype(np.float32) * a
