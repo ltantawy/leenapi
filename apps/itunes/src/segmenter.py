@@ -37,6 +37,28 @@ def _build_palette(n: int) -> np.ndarray:
     return palette
 
 
+def _deletterbox_to(labels: np.ndarray, h: int, w: int) -> np.ndarray:
+    """Map a label map at the model's (letterboxed) mask size back to the frame.
+
+    FastSAM masks come back aspect-fit into a padded canvas at the model input
+    size — e.g. a 1280x720 frame becomes a 320x320 mask with the real content
+    in the middle 320x180 rows and gray padding above and below (the NCNN
+    backend always returns a full square). Naively resizing the whole padded
+    map to the frame squishes the content into a middle band and turns the
+    padding into empty bars. Instead crop the padded region, then resize just
+    the label map (one cheap nearest-neighbor pass) to the full frame.
+    """
+    mh, mw = labels.shape
+    if (mh, mw) == (h, w):
+        return labels
+    r = min(mh / h, mw / w)  # scale used to fit the frame into the mask canvas
+    uh, uw = round(h * r), round(w * r)  # unpadded content size within the mask
+    top, left = (mh - uh) // 2, (mw - uw) // 2
+    crop = labels[top : top + uh, left : left + uw]
+    crop = np.ascontiguousarray(crop)
+    return cv2.resize(crop, (w, h), interpolation=cv2.INTER_NEAREST)
+
+
 def _resolve_model(model: str) -> str:
     """Resolve a model name to a usable path, preferring a fast local NCNN export.
 
@@ -144,9 +166,9 @@ class Segmenter:
             labels = np.zeros((mh, mw), dtype=np.int32)
             for draw_idx, i in enumerate(order):
                 labels[masks[i] > 0.5] = draw_idx + 1
-            # One nearest-neighbor resize of the label map to the frame size.
-            if (mh, mw) != (h, w):
-                labels = cv2.resize(labels, (w, h), interpolation=cv2.INTER_NEAREST)
+            # Undo the model's letterbox padding and map back to the frame in a
+            # single pass, so masks align to the real image (not a middle band).
+            labels = _deletterbox_to(labels, h, w)
 
         # Map labels -> color and opacity in single vectorized passes. Row 0 is
         # the background; row k is the (k-1)-th palette color (cycled).
