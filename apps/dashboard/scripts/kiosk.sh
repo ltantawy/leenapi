@@ -28,7 +28,11 @@ if [ -f "$PREFS" ]; then
   sed -i 's/"exited_cleanly":false/"exited_cleanly":true/; s/"exit_type":"Crashed"/"exit_type":"Normal"/' "$PREFS"
 fi
 
+# This Pi runs a Wayland session (labwc). Without --ozone-platform=wayland
+# Chromium defaults to the X11 backend and dies with "Missing X server or
+# $DISPLAY". The autostart inherits WAYLAND_DISPLAY from the labwc session.
 exec "$CHROMIUM" \
+  --ozone-platform=wayland \
   --kiosk \
   --noerrdialogs \
   --disable-infobars \
