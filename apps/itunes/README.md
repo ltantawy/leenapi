@@ -55,17 +55,27 @@ Open `http://<pi-ip>:8000/` from any device on the network.
 uv run python main.py --help
   --host 0.0.0.0 --port 8000
   --width 1280 --height 720 --framerate 15
-  --alpha 0.5          # mask overlay opacity (0..1)
+  --alpha 0.5          # instance-mask overlay opacity (0..1)
+  --bg-color 40,40,40  # B,G,R fill for pixels no mask covers
+  --bg-alpha 0.85      # background block opacity (higher = more solid fill)
   --quality 80         # output JPEG quality
   --model FastSAM-s    # FastSAM .pt name or NCNN model dir
-  --imgsz 512          # FastSAM inference size (smaller = faster, coarser)
+  --imgsz 320          # FastSAM inference size (smaller = faster, coarser)
   --conf 0.4           # confidence threshold (how many masks appear)
   --iou 0.9            # NMS IoU threshold
   --retina-masks       # full-resolution mask edges (slower, cleaner)
 ```
 
-Segmentation is the bottleneck: lower `--imgsz` (e.g. 320) for a faster mask
-refresh, raise it (e.g. 640) for sharper masks. Video stays smooth regardless.
+**Full coverage:** every pixel is inside a colored block — instance masks get
+distinct colors and all remaining pixels get `--bg-color`. The background is
+blended at `--bg-alpha` (near-solid) so it reads as a filled block, not
+see-through video.
+
+Segmentation is the bottleneck: the **NCNN** model path is by far the fastest on
+the Pi 5 CPU (~10 FPS at `--imgsz 320` vs ~1.3 FPS on the torch `.pt` path) — run
+`scripts/setup_model.sh` so `models/FastSAM-s_ncnn_model/` exists. Lower `--imgsz`
+(e.g. 256) for an even faster refresh, raise it (e.g. 448) for sharper masks.
+Video stays smooth regardless.
 
 ## Layout
 
