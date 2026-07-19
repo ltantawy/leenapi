@@ -72,8 +72,11 @@ uv run python main.py --help
   --overlay            # blend colors over live video instead of solid blocks
   --no-smooth          # disable the crossfade between segmentation passes
   --alpha 0.5          # instance-mask opacity in --overlay mode (0..1)
-  --bg-color 40,40,40  # B,G,R fill for pixels no mask covers
+  --bg-color 255,255,255  # B,G,R fill for pixels no mask covers
   --bg-alpha 0.85      # background block opacity in --overlay mode
+  --stability 0.5      # hold regions through FastSAM dropouts (0=crisp, 1=static)
+  --no-vector          # upscale the low-res mask grid instead of smooth polygons
+  --edge-smooth 0.5    # how much to round the vector block outlines (0..1)
   --quality 80         # output JPEG quality
   --model FastSAM-s    # FastSAM .pt name or NCNN model dir
   --imgsz 320          # FastSAM inference size (smaller = faster, coarser)
@@ -89,6 +92,15 @@ Nothing is see-through, so full coverage is obvious.
 **`--overlay` mode:** the colors are blended over the live video — instances at
 `--alpha`, background at `--bg-alpha` (near-solid so it still reads as a filled
 block). `--bg-color`, `--bg-alpha` and `--alpha` only affect this mode.
+
+**Smooth (vector) edges:** FastSAM produces masks at `--imgsz` (320), so painting
+them by upscaling that grid to a 1280x720 frame puts a hard 4-pixel staircase on
+every boundary. Instead the mask outlines are traced as polygons, simplified and
+corner-rounded in point space, then filled at full frame resolution with subpixel
+anti-aliased edges — the blocks scale up as *shapes*, not as pixels. Raise
+`--edge-smooth` for softer, blobbier outlines or drop it to 0 to follow the mask
+faithfully (still anti-aliased, just not rounded). `--no-vector` restores the old
+pixelated upscale. On this Pi the vector path costs ~19 ms/pass over the old one.
 
 Segmentation is the bottleneck: the **NCNN** model path is by far the fastest on
 the Pi 5 CPU (~10 FPS at `--imgsz 320` vs ~1.3 FPS on the torch `.pt` path) — run

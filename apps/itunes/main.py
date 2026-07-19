@@ -311,6 +311,17 @@ def main() -> int:
              "FastSAM dropouts and eases boundaries (higher=more static, less "
              "responsive; 0=off/crisp, 0.5=balanced default)",
     )
+    parser.add_argument(
+        "--vector", action=argparse.BooleanOptionalAction, default=True,
+        help="render the blocks as smooth, rounded polygons filled at full "
+             "resolution instead of upscaling the low-res mask grid (default: "
+             "on; --no-vector for the older pixelated-edge path)",
+    )
+    parser.add_argument(
+        "--edge-smooth", type=float, default=0.5,
+        help="how much to simplify and round the vector block outlines 0..1 "
+             "(0=faithful to the mask, 1=soft and blobby; default 0.5)",
+    )
     args = parser.parse_args()
 
     try:
@@ -336,6 +347,8 @@ def main() -> int:
             bg_alpha=args.bg_alpha,
             overlay=args.overlay,
             stability=args.stability,
+            vector=args.vector,
+            edge_smooth=args.edge_smooth,
         )
     except (RuntimeError, FileNotFoundError) as exc:
         print(exc, file=sys.stderr)
