@@ -82,7 +82,16 @@ class RpicamMjpegCamera:
                 break  # subprocess ended
             buf += chunk
 
-            # Extract every complete JPEG currently in the buffer.
+            # Drain the buffer to the *newest* complete JPEG, discarding any
+            # older complete frames without decoding them. This is the key
+            # anti-lag step: while a slow consumer (blend + JPEG re-encode) is
+            # busy, rpicam keeps producing and frames pile up in this buffer and
+            # the OS pipe. Decoding and yielding every one of them would make us
+            # forever process stale frames, so end-to-end latency would grow and
+            # stay high. Skipping straight to the latest keeps the displayed
+            # image fresh — bounded to about one frame of lag regardless of how
+            # far behind we fall.
+            latest_jpeg = None
             while True:
                 start = buf.find(_SOI)
                 if start < 0:
@@ -93,15 +102,20 @@ class RpicamMjpegCamera:
                     break
                 end = buf.find(_EOI, start + 2)
                 if end < 0:
-                    # Incomplete frame; drop bytes before the start marker.
+                    # Incomplete frame; drop bytes before the start marker and
+                    # wait for the rest on the next read.
                     if start > 0:
                         del buf[:start]
                     break
                 end += 2  # include EOI
-                jpeg = bytes(buf[start:end])
+                latest_jpeg = bytes(buf[start:end])
                 del buf[:end]
+                # Loop again: if another complete frame is already buffered we
+                # overwrite latest_jpeg with it and drop this (older) one.
+
+            if latest_jpeg is not None:
                 frame = cv2.imdecode(
-                    np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR
+                    np.frombuffer(latest_jpeg, dtype=np.uint8), cv2.IMREAD_COLOR
                 )
                 if frame is not None:
                     yield frame

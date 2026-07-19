@@ -1,12 +1,15 @@
 """Live FastSAM "segment-everything" MJPEG server for the Raspberry Pi camera.
 
-Decoupled pipeline: the camera streams smooth live video while FastSAM runs in a
-background thread (~1-4 FPS on the Pi 5 CPU); the most recent colorized mask
-overlay is blended onto every live frame. Masks therefore lag moving objects —
-an intentional tradeoff to keep the video smooth.
+Decoupled pipeline: capture always jumps to the newest camera frame (dropping any
+backlog, so latency stays low) while FastSAM runs in a background thread (~1-10 FPS
+on the Pi 5 CPU). By default the display is the segmentation itself — solid color
+blocks with temporally-stable colors — crossfaded from one pass to the next so it
+plays smoothly at the full stream frame rate. Pass --overlay to blend the colors
+over the live video instead. The blocks lag moving objects by the segmentation
+interval: an intentional tradeoff for a stable, smooth picture.
 
-    rpicam-vid (MJPEG) ─► OpenCV decode ─┬─► blend latest overlay ─► MJPEG stream (HTTP)
-                                         └─► FastSAM (bg thread) ─► colorized overlay
+    rpicam-vid (MJPEG) ─► newest frame ─┬─► crossfade + blend ─► MJPEG stream (HTTP)
+                                        └─► FastSAM (bg thread) ─► color-stable blocks
 
 Run:   uv run python main.py
 View:  http://<pi-ip>:8000/
@@ -22,6 +25,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
+import numpy as np
 
 from src.camera import CameraConfig, RpicamMjpegCamera
 from src.segmenter import Segmenter
@@ -33,7 +37,7 @@ _INDEX_HTML = b"""<!doctype html>
   h1{font-size:1rem;font-weight:600;padding:.6rem;margin:0}
   img{max-width:100%;height:auto}
 </style></head>
-<body><h1>Raspberry Pi 5 &mdash; live FastSAM segment-everything</h1>
+<body><h1>Raspberry Pi 5 &mdash; live FastSAM segment-everything blocks</h1>
 <img src="/stream" alt="segmented stream"></body></html>
 """
 
@@ -46,10 +50,17 @@ class Pipeline:
     worker produces the colorized overlay reused across many frames.
     """
 
-    def __init__(self, camera: RpicamMjpegCamera, segmenter: Segmenter, jpeg_quality: int = 80):
+    def __init__(
+        self,
+        camera: RpicamMjpegCamera,
+        segmenter: Segmenter,
+        jpeg_quality: int = 80,
+        smooth: bool = True,
+    ):
         self._camera = camera
         self._segmenter = segmenter
         self._jpeg_quality = jpeg_quality
+        self._smooth = smooth
         self._running = False
 
         # Latest raw frame handed from capture -> segment worker.
@@ -57,8 +68,17 @@ class Pipeline:
         self._raw_id = 0
         self._raw_cond = threading.Condition()
 
-        # Latest overlay (color_bgr, alpha_map) from the segment worker.
-        self._overlay = None
+        # Segmentation only updates a few times a second, so the color blocks
+        # would visibly pop from one pass to the next. To raise the *displayed*
+        # frame rate we crossfade from the previous overlay (``_ov_from``) to the
+        # newest one (``_ov_to``) across the many live frames captured in between,
+        # over ``_ov_dur`` seconds. The duration tracks the measured segmentation
+        # interval so each fade finishes just as the next pass lands — a smooth
+        # morph at the full stream rate instead of a ~5 FPS stutter.
+        self._ov_from = None  # (color_bgr, alpha_map)
+        self._ov_to = None  # (color_bgr, alpha_map)
+        self._ov_start = 0.0
+        self._ov_dur = 0.25
         self._overlay_lock = threading.Lock()
 
         # Latest encoded JPEG served to clients.
@@ -86,9 +106,10 @@ class Pipeline:
                 self._raw_id += 1
                 self._raw_cond.notify_all()
 
-            # Blend the most recent overlay (if any) onto this live frame.
-            with self._overlay_lock:
-                overlay = self._overlay
+            # Blend the most recent overlay (if any) onto this live frame,
+            # crossfading between the previous and newest segmentation for a
+            # smooth, high-frame-rate morph rather than a hard pop each pass.
+            overlay = self._current_overlay(time.monotonic())
             if overlay is not None:
                 display = self._segmenter.blend(frame, overlay[0], overlay[1])
             else:
@@ -124,14 +145,55 @@ class Pipeline:
                 processed_id = self._raw_id
 
             color, alpha = self._segmenter.segment(frame)
-            with self._overlay_lock:
-                self._overlay = (color, alpha)
 
             now = time.monotonic()
             dt = now - last
             last = now
             if dt > 0:
                 self._seg_fps = 0.7 * self._seg_fps + 0.3 * (1.0 / dt)
+
+            with self._overlay_lock:
+                # Start a fresh crossfade: fade from whatever is on screen now
+                # (the last target, or this new one on the very first pass) to
+                # the new overlay. Aim the fade to finish about when the next
+                # pass lands by tracking the measured segmentation interval.
+                self._ov_from = self._ov_to if self._ov_to is not None else (color, alpha)
+                self._ov_to = (color, alpha)
+                self._ov_start = now
+                if self._smooth and dt > 0:
+                    self._ov_dur = 0.6 * self._ov_dur + 0.4 * min(max(dt, 0.08), 0.8)
+                else:
+                    self._ov_dur = 0.0
+
+    def _current_overlay(self, now: float):
+        """The overlay to display now, crossfaded between the last two passes.
+
+        Returns ``(color_bgr, alpha_map)`` or ``None`` before the first pass.
+        In steady state (fade complete) it returns the newest overlay directly
+        with no per-frame math; only mid-fade does it interpolate.
+        """
+        with self._overlay_lock:
+            ov_from, ov_to = self._ov_from, self._ov_to
+            start, dur = self._ov_start, self._ov_dur
+        if ov_to is None:
+            return None
+        if ov_from is None or dur <= 0.0:
+            return ov_to
+        t = (now - start) / dur
+        if t >= 1.0:
+            return ov_to
+        if t <= 0.0:
+            return ov_from
+        # Linear crossfade. With temporally-stable colors most pixels are
+        # unchanged between passes, so the fade is clean; only regions that
+        # actually changed morph across the intermediate frames.
+        cf = ov_from[0].astype(np.float32)
+        ct = ov_to[0].astype(np.float32)
+        color = (cf + (ct - cf) * t).astype(np.uint8)
+        af = ov_from[1]
+        at = ov_to[1]
+        alpha = af + (at - af) * t
+        return color, alpha
 
     def snapshot(self, prev_id: int) -> tuple[bytes, int]:
         """Block until a frame newer than prev_id is available."""
@@ -228,7 +290,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--bg-alpha", type=float, default=0.85,
-        help="opacity of the background block (higher=more solid fill, less see-through)",
+        help="overlay-mode opacity of the background block (higher=more solid fill)",
+    )
+    parser.add_argument(
+        "--overlay", action="store_true",
+        help="blend colors over the live video instead of showing solid blocks "
+             "(default: solid segmented blocks, no video underneath)",
+    )
+    parser.add_argument(
+        "--smooth", action=argparse.BooleanOptionalAction, default=True,
+        help="crossfade between segmentation passes for a higher displayed frame "
+             "rate (default: on; --no-smooth to disable)",
     )
     args = parser.parse_args()
 
@@ -253,12 +325,13 @@ def main() -> int:
             retina_masks=args.retina_masks,
             bg_color=bg_color,
             bg_alpha=args.bg_alpha,
+            overlay=args.overlay,
         )
     except (RuntimeError, FileNotFoundError) as exc:
         print(exc, file=sys.stderr)
         return 1
 
-    pipeline = Pipeline(camera, segmenter, jpeg_quality=args.quality)
+    pipeline = Pipeline(camera, segmenter, jpeg_quality=args.quality, smooth=args.smooth)
     pipeline.start()
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(pipeline))

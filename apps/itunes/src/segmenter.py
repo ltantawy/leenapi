@@ -3,12 +3,29 @@
 FastSAM (a CNN, YOLOv8-seg based) produces prompt-free instance masks for
 everything in a frame in a single forward pass — the practical way to get the
 Segment-Anything "segment everything" look on a Pi 5 CPU. We assign each mask a
-distinct color and composite them into a translucent overlay that the caller
-blends over the live frame.
+distinct color and produce a fully color-blocked image.
 
-Output of ``segment()`` is an *overlay* — a color image plus a per-pixel alpha
-map — rather than a finished frame, so a single (slow) segmentation pass can be
-reused across many (fast) live frames by the decoupled broadcaster in main.py.
+Two display modes:
+
+* **blocks** (default) — every pixel is a solid color (instance colors plus a
+  solid background fill), no live video showing through. This is the clean
+  "iTunes-ad" silhouette look and makes the background fill unambiguous.
+* **overlay** — the colors are returned as a translucent layer the caller
+  blends over the live frame.
+
+``segment()`` returns an *overlay* — a color image plus a per-pixel alpha map —
+rather than a finished frame, so one (slow) segmentation pass can be reused
+across many (fast) live frames by the decoupled broadcaster in main.py. In
+blocks mode the alpha map is all ones, so the blend collapses to just the color
+image.
+
+**Temporal color stability.** FastSAM re-runs from scratch each pass, so the
+number of masks and their relative sizes jitter frame to frame. Coloring by
+per-frame rank therefore makes every region flash a new color constantly. To
+stop that, a lightweight tracker matches this frame's masks to recent ones by
+centroid + area and carries each track's color forward; a track survives a few
+missed frames (a grace period) so a momentary FastSAM dropout does not recolor
+a region. Color thus follows a region's identity, not its per-frame rank.
 """
 
 from __future__ import annotations
@@ -23,6 +40,19 @@ _MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
 # How many distinct instance colors to pre-generate before cycling.
 _PALETTE_SIZE = 256
+
+# --- Temporal tracker tuning (all distances/areas are frame-normalized) ---
+# Max centroid distance (as a fraction of the frame) for a mask to match an
+# existing track. Generous enough to survive mask-boundary jitter and modest
+# motion between the ~1-10 FPS segmentation passes.
+_MATCH_MAX_DIST = 0.18
+_MATCH_MAX_DIST2 = _MATCH_MAX_DIST * _MATCH_MAX_DIST
+# A match also requires the areas to be within this ratio, so a small mask does
+# not steal a large track's color just because their centroids coincide.
+_AREA_RATIO_LO, _AREA_RATIO_HI = 0.35, 2.8
+# How many consecutive passes a track may go unmatched before it is dropped.
+# Keeps a color pinned to a region through brief FastSAM dropouts.
+_MAX_MISSED = 8
 
 
 def _build_palette(n: int) -> np.ndarray:
@@ -80,8 +110,28 @@ def _resolve_model(model: str) -> str:
     return f"{stem}.pt"
 
 
+def _centroids_areas(masks_bool: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Frame-normalized (cy, cx, area) for each boolean mask in ``(N, mh, mw)``.
+
+    Vectorized: per-row and per-column pixel counts are dotted with the row/col
+    indices to get first moments, divided by the area. Areas are returned as a
+    fraction of the mask canvas so the tracker is resolution independent.
+    """
+    n, mh, mw = masks_bool.shape
+    rows = np.arange(mh, dtype=np.float64)
+    cols = np.arange(mw, dtype=np.float64)
+    row_counts = masks_bool.sum(axis=2, dtype=np.float64)  # (N, mh)
+    col_counts = masks_bool.sum(axis=1, dtype=np.float64)  # (N, mw)
+    areas = row_counts.sum(axis=1)  # (N,)
+    safe = np.where(areas > 0, areas, 1.0)
+    cy = (row_counts @ rows) / safe / mh
+    cx = (col_counts @ cols) / safe / mw
+    area_norm = areas / float(mh * mw)
+    return cy, cx, area_norm
+
+
 class Segmenter:
-    """FastSAM segment-everything wrapper producing colorized overlays."""
+    """FastSAM segment-everything wrapper producing colorized, color-stable output."""
 
     def __init__(
         self,
@@ -93,6 +143,7 @@ class Segmenter:
         retina_masks: bool = False,
         bg_color: tuple[int, int, int] = (40, 40, 40),
         bg_alpha: float = 0.85,
+        overlay: bool = False,
     ):
         try:
             from ultralytics import FastSAM
@@ -110,8 +161,16 @@ class Segmenter:
         # Color for pixels no instance mask covers, so the whole frame is blocked.
         self.bg_color = np.array(bg_color, dtype=np.uint8)
         # Background is drawn more opaque than instances so it reads as a solid
-        # filled block rather than see-through video.
+        # filled block rather than see-through video (overlay mode only).
         self.bg_alpha = float(np.clip(bg_alpha, 0.0, 1.0))
+        # blocks mode (default): render solid color, no live video underneath.
+        self.overlay = bool(overlay)
+
+        # Temporal color tracker state. Each track: (cy, cx, area, color_id,
+        # missed). color_id indexes the palette (cycled) and is what keeps a
+        # region's color stable across passes.
+        self._tracks: list[list[float]] = []
+        self._next_color = 0
 
         # The torch (.pt) fallback path defaults to a single CPU thread here;
         # use all cores. Harmless for the NCNN path, which threads on its own.
@@ -124,14 +183,75 @@ class Segmenter:
 
         self._model = FastSAM(_resolve_model(model))
 
+    def _assign_colors(
+        self, cy: np.ndarray, cx: np.ndarray, area: np.ndarray
+    ) -> np.ndarray:
+        """Return a stable palette color_id per current instance.
+
+        Greedy nearest-centroid matching of this frame's instances to recent
+        tracks (gated by centroid distance and area ratio); matched instances
+        inherit the track's color, unmatched instances open a new track with a
+        fresh color, and unmatched tracks age out after a grace period.
+        """
+        tracks = self._tracks
+        n = len(cy)
+        assigned = np.full(n, -1, dtype=np.int64)
+
+        # Collect all admissible (distance, instance, track) pairs, then assign
+        # greedily from the closest — a track and an instance are each used once.
+        pairs: list[tuple[float, int, int]] = []
+        for i in range(n):
+            for j, t in enumerate(tracks):
+                d2 = (cy[i] - t[0]) ** 2 + (cx[i] - t[1]) ** 2
+                if d2 > _MATCH_MAX_DIST2:
+                    continue
+                ta = t[2]
+                ratio = area[i] / ta if ta > 0 else float("inf")
+                if ratio < _AREA_RATIO_LO or ratio > _AREA_RATIO_HI:
+                    continue
+                pairs.append((d2, i, j))
+        pairs.sort(key=lambda p: p[0])
+
+        used_tracks: set[int] = set()
+        for _d2, i, j in pairs:
+            if assigned[i] != -1 or j in used_tracks:
+                continue
+            assigned[i] = int(tracks[j][3])
+            used_tracks.add(j)
+            tracks[j][0], tracks[j][1], tracks[j][2] = float(cy[i]), float(cx[i]), float(area[i])
+            tracks[j][4] = 0.0  # reset missed counter
+
+        # Age the pre-existing tracks: matched ones survive (missed reset above),
+        # unmatched ones increment and drop past the grace period. Done before
+        # new tracks are added so a just-created track is never aged this pass.
+        survivors = []
+        for j, t in enumerate(tracks):
+            if j in used_tracks:
+                survivors.append(t)
+            else:
+                t[4] += 1.0
+                if t[4] <= _MAX_MISSED:
+                    survivors.append(t)
+
+        # Open new tracks for unmatched instances (a fresh color each).
+        for i in range(n):
+            if assigned[i] == -1:
+                cid = self._next_color % _PALETTE_SIZE
+                self._next_color += 1
+                assigned[i] = cid
+                survivors.append([float(cy[i]), float(cx[i]), float(area[i]), float(cid), 0.0])
+
+        self._tracks = survivors
+        return assigned
+
     def segment(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Run FastSAM and return ``(color_bgr, alpha_map)`` at the frame's size.
 
-        Every pixel is colored: instance masks get distinct palette colors and
-        all remaining (background) pixels get ``self.bg_color``. Background is
-        blended at ``self.bg_alpha`` (near-solid) and instances at
-        ``self.alpha``, so the frame is fully color-blocked with the background
-        reading as a solid fill rather than see-through video.
+        Every pixel is colored: instance masks get temporally-stable palette
+        colors and all remaining (background) pixels get ``self.bg_color``. In
+        blocks mode the alpha map is all ones (solid color, no video); in
+        overlay mode background is blended at ``self.bg_alpha`` and instances at
+        ``self.alpha``.
 
         Colorization is done via a small integer label map at mask resolution
         (0 = background, k = the k-th painted instance), resized to the frame
@@ -155,29 +275,46 @@ class Segmenter:
         if masks is None:
             # No instances: the whole frame is one solid background block.
             labels = np.zeros((h, w), dtype=np.int32)
+            color_ids = np.empty(0, dtype=np.int64)
             n = 0
         else:
             masks = masks.data  # (N, mh, mw) tensor, values in [0, 1]
             masks = np.asarray(masks.cpu().numpy() if hasattr(masks, "cpu") else masks)
-            n, mh, mw = masks.shape
-            # Build a label map at mask resolution. Paint largest masks first
-            # so smaller objects land on top (higher label) and stay visible.
-            order = np.argsort(masks.reshape(n, -1).sum(axis=1))[::-1]
+            masks_bool = masks > 0.5
+            n, mh, mw = masks_bool.shape
+
+            # Stable per-instance colors from the temporal tracker.
+            cy, cx, area = _centroids_areas(masks_bool)
+            color_ids = self._assign_colors(cy, cx, area)
+
+            # Build a label map at mask resolution. Paint largest masks first so
+            # smaller objects land on top (higher label) and stay visible. The
+            # label is only a draw slot; its *color* comes from color_ids, so
+            # occlusion order no longer perturbs which color a region shows.
+            order = np.argsort(area)[::-1]
             labels = np.zeros((mh, mw), dtype=np.int32)
+            slot_color = np.empty(n, dtype=np.int64)  # color_id per draw slot
             for draw_idx, i in enumerate(order):
-                labels[masks[i] > 0.5] = draw_idx + 1
+                labels[masks_bool[i]] = draw_idx + 1
+                slot_color[draw_idx] = color_ids[i]
+            color_ids = slot_color
             # Undo the model's letterbox padding and map back to the frame in a
             # single pass, so masks align to the real image (not a middle band).
             labels = _deletterbox_to(labels, h, w)
 
         # Map labels -> color and opacity in single vectorized passes. Row 0 is
-        # the background; row k is the (k-1)-th palette color (cycled).
+        # the background; row k is the tracked color of the k-th painted slot.
         color_lut = np.empty((n + 1, 3), dtype=np.uint8)
         color_lut[0] = self.bg_color
-        color_lut[1:] = self.palette[np.arange(n) % _PALETTE_SIZE]
+        if n:
+            color_lut[1:] = self.palette[color_ids % _PALETTE_SIZE]
 
-        alpha_lut = np.full(n + 1, self.alpha, dtype=np.float32)
-        alpha_lut[0] = self.bg_alpha
+        if self.overlay:
+            alpha_lut = np.full(n + 1, self.alpha, dtype=np.float32)
+            alpha_lut[0] = self.bg_alpha
+        else:
+            # blocks mode: solid everywhere, no live video underneath.
+            alpha_lut = np.ones(n + 1, dtype=np.float32)
 
         color = color_lut[labels]
         alpha = alpha_lut[labels]
@@ -186,7 +323,11 @@ class Segmenter:
     def blend(
         self, frame_bgr: np.ndarray, color_bgr: np.ndarray, alpha_map: np.ndarray
     ) -> np.ndarray:
-        """Composite an overlay from :meth:`segment` onto a (current) frame."""
+        """Composite an overlay from :meth:`segment` onto a (current) frame.
+
+        In blocks mode the alpha map is all ones, so this returns just the color
+        image (video does not show through).
+        """
         if color_bgr.shape[:2] != frame_bgr.shape[:2]:
             h, w = frame_bgr.shape[:2]
             color_bgr = cv2.resize(color_bgr, (w, h), interpolation=cv2.INTER_NEAREST)
