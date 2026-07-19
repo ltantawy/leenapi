@@ -1,28 +1,42 @@
 # Pi Segment — live FastSAM "segment everything" on the Raspberry Pi 5 camera
 
 Captures the Pi camera and runs **FastSAM** (a CNN Segment-Anything variant) in
-"segment everything" mode, drawing every detected object/region in its own color
-over the live scene — the [Segment Anything](https://github.com/facebookresearch/segment-anything)
+"segment everything" mode, painting every detected object/region in its own solid
+color — the [Segment Anything](https://github.com/facebookresearch/segment-anything)
 look, on the Pi 5 CPU. Served as a headless **MJPEG stream** you can open in any
 browser.
 
+By default it shows **solid segmented blocks** (no live video underneath): every
+pixel is a solid color, so the background fill is unambiguous. Pass `--overlay` to
+instead blend the colors translucently over the live video.
+
 ```
-rpicam-vid (MJPEG) ─► OpenCV decode ─┬─► blend latest overlay ─► HTTP MJPEG stream
-                                     └─► FastSAM (bg thread)  ─► colorized overlay
+rpicam-vid (MJPEG) ─► OpenCV decode ─┬─► crossfade + blend ─► HTTP MJPEG stream
+                                     └─► FastSAM (bg thread) ─► color-stable blocks
 ```
 
 ## How it works (important)
 
 Real Segment Anything is far too heavy for a Pi CPU, and even lightweight SAM
 variants' automatic "everything" mode is multi-pass. **FastSAM** gets all masks
-in a single forward pass, but still only reaches ~1–4 FPS on the Pi 5 CPU. So the
+in a single forward pass, but still only reaches ~1–10 FPS on the Pi 5 CPU. So the
 pipeline is **decoupled**:
 
-- The camera streams **smooth live video** at the camera framerate.
-- **FastSAM runs in a background thread** (~1–4 FPS); its most recent colorized
-  mask overlay is blended onto every live frame.
-- Consequence: masks **lag moving objects** by a fraction of a second. Intentional
-  tradeoff for smooth video.
+- The camera streams frames at the camera framerate; capture always jumps to the
+  **newest** frame, dropping any that piled up while busy — this bounds the
+  real-life-to-web latency to about one frame instead of letting it grow.
+- **FastSAM runs in a background thread** (~1–10 FPS); its most recent colorized
+  result is the display.
+- **Stable colors:** a lightweight tracker matches each pass's masks to recent
+  ones by centroid + area and carries each region's color forward (surviving brief
+  FastSAM dropouts), so colors follow object identity instead of flashing a new
+  color every pass.
+- **Smooth playback:** because segmentation only updates a few times a second, the
+  display **crossfades** from the previous result to the newest one across the
+  live frames in between — a smooth morph at the full stream frame rate rather than
+  a ~5 FPS stutter. Disable with `--no-smooth`.
+- Consequence: the blocks **lag moving objects** by a fraction of a second (the
+  segmentation interval). Intentional tradeoff for a stable, smooth picture.
 
 ## Prerequisites
 
@@ -55,9 +69,11 @@ Open `http://<pi-ip>:8000/` from any device on the network.
 uv run python main.py --help
   --host 0.0.0.0 --port 8000
   --width 1280 --height 720 --framerate 15
-  --alpha 0.5          # instance-mask overlay opacity (0..1)
+  --overlay            # blend colors over live video instead of solid blocks
+  --no-smooth          # disable the crossfade between segmentation passes
+  --alpha 0.5          # instance-mask opacity in --overlay mode (0..1)
   --bg-color 40,40,40  # B,G,R fill for pixels no mask covers
-  --bg-alpha 0.85      # background block opacity (higher = more solid fill)
+  --bg-alpha 0.85      # background block opacity in --overlay mode
   --quality 80         # output JPEG quality
   --model FastSAM-s    # FastSAM .pt name or NCNN model dir
   --imgsz 320          # FastSAM inference size (smaller = faster, coarser)
@@ -66,10 +82,13 @@ uv run python main.py --help
   --retina-masks       # full-resolution mask edges (slower, cleaner)
 ```
 
-**Full coverage:** every pixel is inside a colored block — instance masks get
-distinct colors and all remaining pixels get `--bg-color`. The background is
-blended at `--bg-alpha` (near-solid) so it reads as a filled block, not
-see-through video.
+**Default (blocks) mode:** every pixel is a solid color — instance masks get
+distinct, temporally-stable colors and all remaining pixels get `--bg-color`.
+Nothing is see-through, so full coverage is obvious.
+
+**`--overlay` mode:** the colors are blended over the live video — instances at
+`--alpha`, background at `--bg-alpha` (near-solid so it still reads as a filled
+block). `--bg-color`, `--bg-alpha` and `--alpha` only affect this mode.
 
 Segmentation is the bottleneck: the **NCNN** model path is by far the fastest on
 the Pi 5 CPU (~10 FPS at `--imgsz 320` vs ~1.3 FPS on the torch `.pt` path) — run
