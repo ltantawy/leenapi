@@ -120,10 +120,13 @@ class Pipeline:
             last = now
             if dt > 0:
                 self._video_fps = 0.9 * self._video_fps + 0.1 * (1.0 / dt)
-            cv2.putText(
-                display, f"{self._video_fps:4.1f} FPS video  {self._seg_fps:4.1f} FPS seg",
-                (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA,
-            )
+            # Draw a black outline then white fill so the HUD stays legible on
+            # any background — including the white background block.
+            hud = f"{self._video_fps:4.1f} FPS video  {self._seg_fps:4.1f} FPS seg"
+            cv2.putText(display, hud, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(display, hud, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (255, 255, 255), 1, cv2.LINE_AA)
 
             ok, jpeg = cv2.imencode(".jpg", display, encode_params)
             if not ok:
@@ -285,7 +288,7 @@ def main() -> int:
     parser.add_argument("--iou", type=float, default=0.9, help="FastSAM NMS IoU threshold")
     parser.add_argument("--retina-masks", action="store_true", help="full-resolution mask edges (slower)")
     parser.add_argument(
-        "--bg-color", default="40,40,40",
+        "--bg-color", default="255,255,255",
         help="B,G,R color for pixels no mask covers (whole frame stays color-blocked)",
     )
     parser.add_argument(

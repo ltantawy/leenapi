@@ -54,15 +54,41 @@ _AREA_RATIO_LO, _AREA_RATIO_HI = 0.35, 2.8
 # Keeps a color pinned to a region through brief FastSAM dropouts.
 _MAX_MISSED = 8
 
+# --- Spatial color memory ---
+# A track only survives a few missed passes; when a region disappears for
+# longer and then comes back it would otherwise open a new track and flash a
+# fresh color. A coarse grid remembers which color last occupied each cell of
+# the frame for much longer, so a region that vanishes and reappears at roughly
+# the same place gets its old color back. This is what stops the "colors jump
+# as segments disappear then reappear" flicker beyond the track grace period.
+_GRID = 24  # cells per axis over the normalized frame
+# Passes a grid cell keeps its remembered color after nothing touches it. Long
+# so colors persist across extended dropouts; expires eventually so a genuinely
+# changed scene can recolor rather than being pinned forever.
+_GRID_MAX_AGE = 150
+
 
 def _build_palette(n: int) -> np.ndarray:
-    """`n` visually distinct, saturated BGR colors via golden-ratio hue spacing."""
+    """`n` distinct **shades of purple** as BGR colors.
+
+    All colors live in the blue-violet..magenta hue band so the whole scene
+    reads as purples on the white background, but saturation and value are
+    spread (via two decorrelated golden-ratio walks) so neighboring regions stay
+    distinguishable — light lavender through deep violet. Hue/sat/value are
+    kept away from the extremes so no shade washes out to near-white (which would
+    vanish against the white background) or collapses to near-black.
+    """
     palette = np.zeros((n, 3), dtype=np.uint8)
     golden = 0.618033988749895
-    hue = 0.1
+    h = 0.0
+    v = 0.35
     for i in range(n):
-        hue = (hue + golden) % 1.0
-        hsv = np.uint8([[[int(hue * 179), 200, 255]]])
+        h = (h + golden) % 1.0
+        v = (v + golden * 1.37) % 1.0  # decorrelated from the hue walk
+        hue = int(125 + h * 30)            # 125..155: blue-violet -> purple -> magenta
+        val = int(150 + v * 95)            # 150..245: mid -> bright (never near-white)
+        sat = int(255 - v * 110)           # 255..145: brighter shades a bit less saturated
+        hsv = np.uint8([[[hue, sat, val]]])
         palette[i] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
     return palette
 
@@ -141,7 +167,7 @@ class Segmenter:
         iou: float = 0.9,
         alpha: float = 0.5,
         retina_masks: bool = False,
-        bg_color: tuple[int, int, int] = (40, 40, 40),
+        bg_color: tuple[int, int, int] = (255, 255, 255),
         bg_alpha: float = 0.85,
         overlay: bool = False,
     ):
@@ -171,6 +197,13 @@ class Segmenter:
         # region's color stable across passes.
         self._tracks: list[list[float]] = []
         self._next_color = 0
+
+        # Spatial color memory: which color last occupied each frame cell, and
+        # how many passes since it was touched (for expiry). -1 == empty. This
+        # outlives individual tracks so a region that disappears and reappears
+        # recovers its old color instead of flashing a new one.
+        self._grid_color = np.full((_GRID, _GRID), -1, dtype=np.int64)
+        self._grid_age = np.zeros((_GRID, _GRID), dtype=np.int64)
 
         # The torch (.pt) fallback path defaults to a single CPU thread here;
         # use all cores. Harmless for the NCNN path, which threads on its own.
@@ -233,16 +266,48 @@ class Segmenter:
                 if t[4] <= _MAX_MISSED:
                     survivors.append(t)
 
-        # Open new tracks for unmatched instances (a fresh color each).
+        # Open new tracks for unmatched instances. Prefer a color remembered for
+        # this region's grid cell (so a reappearing region recovers its color);
+        # only mint a fresh color when the cell has none. This is the key fix for
+        # colors jumping as segments disappear and come back.
         for i in range(n):
             if assigned[i] == -1:
-                cid = self._next_color % _PALETTE_SIZE
-                self._next_color += 1
+                gy, gx = self._grid_cell(cy[i], cx[i])
+                remembered = int(self._grid_color[gy, gx])
+                if remembered >= 0:
+                    cid = remembered
+                else:
+                    cid = self._next_color % _PALETTE_SIZE
+                    self._next_color += 1
                 assigned[i] = cid
                 survivors.append([float(cy[i]), float(cx[i]), float(area[i]), float(cid), 0.0])
 
         self._tracks = survivors
+        self._update_grid(cy, cx, assigned)
         return assigned
+
+    @staticmethod
+    def _grid_cell(cy: float, cx: float) -> tuple[int, int]:
+        """Clamp a normalized centroid to a ``(_GRID, _GRID)`` cell index."""
+        gy = min(_GRID - 1, max(0, int(cy * _GRID)))
+        gx = min(_GRID - 1, max(0, int(cx * _GRID)))
+        return gy, gx
+
+    def _update_grid(self, cy: np.ndarray, cx: np.ndarray, assigned: np.ndarray) -> None:
+        """Stamp each instance's color into its grid cell and expire stale cells.
+
+        Every cell ages one pass; a cell touched this pass resets to 0 and takes
+        the color of the instance there, so the memory tracks the current scene.
+        Cells untouched past the grace age are cleared so a changed scene can be
+        recolored instead of being pinned to old colors forever.
+        """
+        self._grid_age += 1
+        for i in range(len(cy)):
+            gy, gx = self._grid_cell(cy[i], cx[i])
+            self._grid_color[gy, gx] = int(assigned[i])
+            self._grid_age[gy, gx] = 0
+        expired = self._grid_age > _GRID_MAX_AGE
+        self._grid_color[expired] = -1
 
     def segment(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Run FastSAM and return ``(color_bgr, alpha_map)`` at the frame's size.
