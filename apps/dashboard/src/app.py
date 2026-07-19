@@ -10,9 +10,15 @@ response shape, so there is exactly one description of a todo on the wire.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from flask import Flask, jsonify, render_template, request
 
 from src.store import Store, Todo
+
+# Templates live at the project root (apps/dashboard/templates), not under
+# src/. Flask(__name__) would root the search at src/, so point it explicitly.
+_TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 
 
 def _serialize(todo: Todo) -> dict:
@@ -20,7 +26,7 @@ def _serialize(todo: Todo) -> dict:
 
 
 def create_app(store: Store) -> Flask:
-    app = Flask(__name__)
+    app = Flask(__name__, template_folder=str(_TEMPLATES))
 
     @app.get("/api/todos")
     def list_todos():
@@ -43,5 +49,9 @@ def create_app(store: Store) -> Flask:
     def delete_todo(todo_id: int):
         store.delete(todo_id)
         return "", 204
+
+    @app.get("/phone")
+    def phone():
+        return render_template("phone.html")
 
     return app
