@@ -305,6 +305,12 @@ def main() -> int:
         help="crossfade between segmentation passes for a higher displayed frame "
              "rate (default: on; --no-smooth to disable)",
     )
+    parser.add_argument(
+        "--stability", type=float, default=0.5,
+        help="temporal persistence 0..1 that holds a region's color through "
+             "FastSAM dropouts and eases boundaries (higher=more static, less "
+             "responsive; 0=off/crisp, 0.5=balanced default)",
+    )
     args = parser.parse_args()
 
     try:
@@ -329,6 +335,7 @@ def main() -> int:
             bg_color=bg_color,
             bg_alpha=args.bg_alpha,
             overlay=args.overlay,
+            stability=args.stability,
         )
     except (RuntimeError, FileNotFoundError) as exc:
         print(exc, file=sys.stderr)
