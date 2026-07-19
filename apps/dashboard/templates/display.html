@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Dashboard</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; height: 100vh; overflow: hidden;
+      background: #0b0b0d; color: #f2f2f2;
+      font-family: system-ui, sans-serif;
+      display: flex; flex-direction: column;
+      padding: 3vh 4vw;
+      cursor: none;
+    }
+    header { margin-bottom: 3vh; }
+    #date { font-size: 4vh; font-weight: 600; }
+    #clock { font-size: 9vh; font-weight: 200; line-height: 1; }
+    h2 {
+      font-size: 3vh; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .1em; color: #888; margin: 0 0 2vh;
+    }
+    ul { list-style: none; padding: 0; margin: 0; overflow: hidden; }
+    li {
+      font-size: 4.5vh; padding: 1.2vh 0;
+      border-bottom: 1px solid #1e1e22;
+    }
+    li.done { color: #555; text-decoration: line-through; }
+    #empty { font-size: 3.5vh; color: #555; }
+  </style>
+</head>
+<body>
+  <header>
+    <div id="clock"></div>
+    <div id="date"></div>
+  </header>
+  <h2>Todo</h2>
+  <ul id="list"></ul>
+  <div id="empty" hidden>Nothing on the list.</div>
+
+  <script>
+    const list = document.getElementById("list");
+    const empty = document.getElementById("empty");
+
+    function tick() {
+      const now = new Date();
+      document.getElementById("clock").textContent =
+        now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      document.getElementById("date").textContent =
+        now.toLocaleDateString([], {
+          weekday: "long", month: "long", day: "numeric",
+        });
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch("/api/todos");
+        const { todos } = await response.json();
+        empty.hidden = todos.length > 0;
+        list.replaceChildren(...todos.map((todo) => {
+          const li = document.createElement("li");
+          if (todo.done) li.classList.add("done");
+          li.textContent = todo.text;
+          return li;
+        }));
+      } catch (err) {
+        // Server restarting or briefly unreachable — keep showing the last
+        // known list rather than blanking the screen.
+      }
+    }
+
+    tick();
+    refresh();
+    setInterval(tick, 1000);
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>

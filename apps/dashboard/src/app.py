@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 from src.store import Store, Todo
 
@@ -53,5 +53,13 @@ def create_app(store: Store) -> Flask:
     @app.get("/phone")
     def phone():
         return render_template("phone.html")
+
+    @app.get("/")
+    def index():
+        return redirect(url_for("display"))
+
+    @app.get("/display")
+    def display():
+        return render_template("display.html")
 
     return app
