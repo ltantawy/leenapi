@@ -78,3 +78,17 @@ def test_phone_page_renders(client):
 
     assert response.status_code == 200
     assert b"<form" in response.data
+
+
+def test_display_page_renders(client):
+    response = client.get("/display")
+
+    assert response.status_code == 200
+    assert b"todo" in response.data.lower()
+
+
+def test_root_redirects_to_display(client):
+    response = client.get("/")
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/display")
